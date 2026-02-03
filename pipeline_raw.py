@@ -12,11 +12,16 @@ parser = argparse.ArgumentParser()
 
 parser.add_argument("--prompt", type=str,
                    help="Which data do you want to fetch from the database?")
+
+parser.add_argument("--credentials_path", type=str, default="env/.env",
+                    help="Enter the path to the .env file.")
+
 args = parser.parse_args()
 
 question = args.prompt
+env_path = args.credentials_path
 
-if load_dotenv("/workspace/text_to_sql/env/.env"):
+if load_dotenv(env_path):
     db_ip = os.getenv("DATABASE_IP")
     db_port = os.getenv("DATABASE_PORT")
     db_user = os.getenv("POSTGRES_USER")
@@ -34,9 +39,9 @@ credentials = {
 with open("structure_employee_contacts.sql", "r") as file:
     ddl_context = file.read()
     
-cache_dir = "/workspace/hf_cache"
+cache_dir = "/home/murad/.cache"
 
-model_id = "Qwen/Qwen2.5-Coder-32B-Instruct"
+model_id = "Qwen/Qwen2.5-Coder-7B-Instruct"
 
 def load_model(model_id: str):
     print(f"Model {model_id} started to be loaded!")
@@ -55,14 +60,14 @@ def load_model(model_id: str):
     tokenizer = AutoTokenizer.from_pretrained(
         model_id,
         trust_remote_code=True,
-        cache_dir=cache_dir
+        # cache_dir=cache_dir
     )
 
     # Load model
     model = AutoModelForCausalLM.from_pretrained(
         model_id,
         quantization_config=bnb_config,
-        cache_dir=cache_dir,
+        # cache_dir=cache_dir,
         device_map={"": 0},
         trust_remote_code=True,
         dtype=torch.float16
@@ -71,6 +76,7 @@ def load_model(model_id: str):
     return model, tokenizer
 
 try:
+    print("Starting to load the model")
     model, tokenizer = load_model(model_id)
     system_prompt = f"""
         You are an expert PostgreSQL query generator. Your job is to generate the SQL Query 
