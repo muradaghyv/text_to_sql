@@ -5,6 +5,7 @@ from openai import OpenAI
 
 from contextlib import asynccontextmanager
 import re
+import time
 
 import asyncpg
 
@@ -12,12 +13,12 @@ from dotenv import load_dotenv
 import os
 
 # Selected model
-model_name = "Qwen/Qwen2.5-Coder-14B-Instruct-AWQ"
+model_name = "cyankiwi/Qwen3-30B-A3B-Instruct-2507-AWQ-4bit"
 
 # Connecting to vLLM model
 try:
     client = OpenAI(
-        base_url="http://localhost:8000/v1",
+        base_url="https://rk70l37j3dpwnh-8000.proxy.runpod.net/v1",
         api_key="EMPTY"
     )
     print("Connected to the model server successfully!")
@@ -113,6 +114,7 @@ async def generate_answer(user_request: UserRequest):
     ddl_context = get_db_schema()
 
     try:
+        starting_time = time.time()
         print("Generating response according to the given question. . .")
         llm_response = client.chat.completions.create(
             model=model_name,
@@ -131,6 +133,10 @@ async def generate_answer(user_request: UserRequest):
                     - The first character of the output MUST be SELECT, INSERT, UPDATE, or DELETE.
                     - The last character MUST be a semicolon (;).
                     - Return NOTHING except the SQL query itself.
+
+                    EXAMPLE:
+                    User: "Please provide Mirzə Abbaszadə's registered address and LinkedIn address."
+                    Output: SELECT reg_addr, linkedin FROM employee WHERE first_name = 'Mirzə' AND last_name = 'Abbaszadə';
                         """
                 },
                 {
@@ -141,6 +147,7 @@ async def generate_answer(user_request: UserRequest):
             temperature=0.1
         )
         
+        processing_time = time.time() - starting_time
         print("Response was generated successfully!")
         
     except Exception as e:
@@ -157,6 +164,7 @@ async def generate_answer(user_request: UserRequest):
     return {
         "success": True,
         "message": "Query is generated successfully!",
+        "processing_time": processing_time,
         "original_prompt": user_request.prompt,
         "generated_sql": sql_query,
         "data": data
