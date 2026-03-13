@@ -24,6 +24,9 @@ def get_connection(env_path: str="env/.env"):
             "port": os.getenv("DATABASE_PORT")
         }
     
+    else:
+        raise ValueError(f"Couldn't find the credentials!")
+    
     try:
         connection = psycopg2.connect(
             **credentials,
@@ -33,7 +36,7 @@ def get_connection(env_path: str="env/.env"):
         return connection
     
     except Exception as e:
-        raise ValueError(f"Error connecting to a database!")
+        raise ValueError(f"Error connecting to a database: {e}")
 
 def list_table_names(connection: psycopg2.extensions.connection):
     query = """
