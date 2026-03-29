@@ -103,7 +103,7 @@ def build_ddl(table_name: str, columns: list[ColummnInfo]) -> str:
             parts.append("NOT NULL")
         
         if col.column_default:
-            parts.append(f"DEAFULT {col.column_default}")
+            parts.append(f"DEFAULT {col.column_default}")
         
         if col.is_primary_key:
             parts.append("PRIMARY KEY")

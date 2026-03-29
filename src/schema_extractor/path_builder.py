@@ -14,7 +14,7 @@ B - C and A - C. So, we can create a two-hop path: A - C - B.
 """
 from collections import defaultdict
 from dataclasses import dataclass
-from fk_extractor import FKRelationship
+from schema_extractor.fk_extractor import FKRelationship
 
 @dataclass
 class TwoHopPath:
@@ -57,4 +57,42 @@ def build_adjacency(fks: list[FKRelationship]) -> dict[str, set[str]]:
     return adjacency
 
 def find_two_hop_paths(adjacency: dict[str, set[str]]) -> list[TwoHopPath]:
-    
+    """
+    Finds all pairs of tables (A, B) that share a common FK neighbor (bridge table)
+    but are NOT directly connected to each other.
+
+    Algorithm:
+        For each bridge table C, look at every pair of C's neighbors (A, B).
+        If A and B are not directly connected, record A - C - B.
+        We sort (A, B) so that A < B alphabetically to avoid recording
+        the same path twice (A-C-B and B-C-A are the same path).
+
+    Example:
+        customers -- orders -- products
+        customers and products are not directly connected,
+        but both connect to orders → two-hop path: customers - orders - products
+    """
+    paths = []
+    seen: set[tuple[str, str, str]] = set()
+
+    for bridge_table, neighbors in adjacency.items():
+        neighbor_list = sorted(neighbors)
+        for i in range(len(neighbor_list)):
+            for j in range(i + 1, len(neighbor_list)):
+                table_a = neighbor_list[i]
+                table_b = neighbor_list[j]
+
+                # Skip if they already have a direct FK relationship
+                if table_b in adjacency.get(table_a, set()):
+                    continue
+
+                key = (table_a, bridge_table, table_b)
+                if key not in seen:
+                    seen.add(key)
+                    paths.append(TwoHopPath(
+                        table_a=table_a,
+                        bridge_table=bridge_table,
+                        table_b=table_b
+                    ))
+
+    return paths

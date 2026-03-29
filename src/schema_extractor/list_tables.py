@@ -4,7 +4,10 @@ import psycopg2.extras
 from dotenv import load_dotenv
 import os
 
-def get_connection(env_path: str="env/.env"):
+_PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+_DEFAULT_ENV = os.path.join(_PROJECT_ROOT, "env", ".env")
+
+def get_connection(env_path: str = _DEFAULT_ENV):
     """
     Connects to a PostgreSQL DB and returns psycopg2 instance.
 
