@@ -7,3 +7,7 @@ env/.env
 *.ipynb
 
 .vscode
+
+__pycache__/
+*.pyc
+*.xlsx
