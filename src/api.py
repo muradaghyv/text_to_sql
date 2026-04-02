@@ -1,199 +1,178 @@
-from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel
-
-from openai import OpenAI
-
-from contextlib import asynccontextmanager
 import re
 import time
+import json
+import os
+from contextlib import asynccontextmanager
 
 import asyncpg
-
+from fastapi import FastAPI, HTTPException
+from pydantic import BaseModel
+from openai import OpenAI
 from dotenv import load_dotenv
-import os
 
-# Selected model
-model_name = "cyankiwi/Qwen3-30B-A3B-Instruct-2507-AWQ-4bit"
+from description_embedder.embedder import Embedder
+from query_pipeline.retriever import retrieve_context
 
-# Connecting to vLLM model
-try:
-    client = OpenAI(
-        base_url="https://rk70l37j3dpwnh-8000.proxy.runpod.net/v1",
-        api_key="EMPTY"
-    )
-    print("Connected to the model server successfully!")
+# ── Config ────────────────────────────────────────────────────────────────────
 
-except Exception as e:
-    raise ValueError(f"An error occurred when connecting to the model server!")
-    
-env_path = "/workspace/text_to_sql/env/.env"
-if not os.path.exists(env_path):
-    print(f"WARNING: .env file not found at {env_path}")
+PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+ENV_PATH = os.path.join(PROJECT_ROOT, "env", ".env")
 
-load_dotenv(env_path)
+load_dotenv(ENV_PATH)
 
-db_ip = os.getenv("DATABASE_IP")
-db_port = os.getenv("DATABASE_PORT", "5432") # Default to 5432 if missing
-db_user = os.getenv("POSTGRES_USER")
-db_name = os.getenv("POSTGRES_DB_NAME")
-db_password = os.getenv("POSTGRES_PASSWORD")
+LLM_BASE_URL = os.getenv("LLM_BASE_URL")
+LLM_MODEL    = os.getenv("LLM_MODEL")
 
-# DEBUG: Print the config (Masking password) to verify IP is loaded
-print(f"DEBUG -> Connecting to DB at IP: '{db_ip}', User: '{db_user}', DB: '{db_name}'")
+DB_HOST     = os.getenv("DATABASE_IP")
+DB_PORT     = os.getenv("DATABASE_PORT", "5432")
+DB_USER     = os.getenv("POSTGRES_USER")
+DB_NAME     = os.getenv("POSTGRES_DB_NAME")
+DB_PASSWORD = os.getenv("POSTGRES_PASSWORD")
 
-if not db_ip:
-    raise ValueError("CRITICAL ERROR: DATABASE_IP is None! Check your .env file.")
+META_HOST     = os.getenv("METADATA_DB_HOST")
+META_PORT     = os.getenv("METADATA_DB_PORT", "5432")
+META_USER     = os.getenv("METADATA_DB_USER")
+META_DB_NAME  = os.getenv("METADATA_DB_NAME")
+META_PASSWORD = os.getenv("METADATA_DB_PASSWORD")
 
-database_url = f"postgres://{db_user}:{db_password}@{db_ip}:{db_port}/{db_name}"
-# Defining context manager for creating multiple connections to DB for asynchronous read-write
+for key, val in [
+    ("LLM_BASE_URL", LLM_BASE_URL), ("LLM_MODEL", LLM_MODEL),
+    ("DATABASE_IP", DB_HOST), ("POSTGRES_USER", DB_USER),
+    ("POSTGRES_DB_NAME", DB_NAME), ("POSTGRES_PASSWORD", DB_PASSWORD),
+    ("METADATA_DB_HOST", META_HOST), ("METADATA_DB_USER", META_USER),
+    ("METADATA_DB_NAME", META_DB_NAME), ("METADATA_DB_PASSWORD", META_PASSWORD),
+]:
+    if not val:
+        raise ValueError(f"Missing required env var: {key}")
+
+llm_client = OpenAI(base_url=LLM_BASE_URL, api_key="EMPTY")
+
+
+# ── Lifespan ──────────────────────────────────────────────────────────────────
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    print("App is starting up, creating database connection pool.")
-    pool = await asyncpg.create_pool(
-        user=db_user,
-        password=db_password,
-        database=db_name,
-        host=db_ip,
-        port=db_port
+    print("Starting up...")
+
+    # Target DB pool
+    app.state.db_pool = await asyncpg.create_pool(
+        host=DB_HOST, port=DB_PORT,
+        user=DB_USER, password=DB_PASSWORD, database=DB_NAME,
     )
+    print(f"  Target DB pool ready ({DB_NAME})")
 
-    app.state.pool = pool
+    # Metadata DB pool
+    app.state.meta_pool = await asyncpg.create_pool(
+        host=META_HOST, port=META_PORT,
+        user=META_USER, password=META_PASSWORD, database=META_DB_NAME,
+    )
+    print(f"  Metadata DB pool ready ({META_DB_NAME})")
 
-    print("Connection pool is created successfully!")
+    # Embedder (loads BGE-M3 once)
+    print("  Loading BGE-M3 embedder...")
+    app.state.embedder = Embedder()
+    print("  Embedder ready.")
 
-    yield 
+    yield
 
-    print("App is shutting down, closing database connection pools")
+    await app.state.db_pool.close()
+    await app.state.meta_pool.close()
+    print("Shutdown complete.")
 
-    pool = app.state.pool
-
-    await pool.close()
-
-    print("Connection pool is closed successfully!")
 
 app = FastAPI(lifespan=lifespan)
 
+
+# ── Request / response models ─────────────────────────────────────────────────
+
 class UserRequest(BaseModel):
     prompt: str
+    top_k: int = 5   # number of tables to retrieve via vector search
 
-class APIResponse(BaseModel):
-    original_promt: str
-    generated_sql: str
-    data: list
 
-# Helper function 1 - reading DDL
-def get_db_schema():
-    try:
-        with open("/workspace/text_to_sql/structure_employee_contacts.sql", "r") as file:
-            return file.read()
-        print("DDL Context read successful!")
-    except Exception as e:
-        raise ValueError("Error in reading DDL context!")
+# ── Helpers ───────────────────────────────────────────────────────────────────
 
-# Helper Function 2 - formatting generated SQL Query
 def format_sql(text: str) -> str:
     text = re.sub(r"```sql|```", "", text, flags=re.IGNORECASE).strip()
-
     if not text.endswith(";"):
         text += ";"
-
     return text
 
-async def execute_query(sql_query: str):
-    pool = app.state.pool
 
-    async with pool.acquire() as connection:
+async def execute_query(pool, sql: str) -> list[dict]:
+    async with pool.acquire() as conn:
         try:
-            result = await connection.fetch(sql_query)
-            return [dict(row) for row in result]
+            rows = await conn.fetch(sql)
+            return [dict(r) for r in rows]
         except Exception as e:
-            raise HTTPException(status_code=500, detail="Database error!")
-    
+            raise HTTPException(status_code=500, detail=f"Database error: {e}")
+
+
+# ── Endpoint ──────────────────────────────────────────────────────────────────
+
 @app.post("/generate")
 async def generate_answer(user_request: UserRequest):
-    ddl_context = get_db_schema()
+    t_start = time.time()
+
+    # 1. Retrieve relevant schema context
+    try:
+        ddl_context, table_names = await retrieve_context(
+            meta_pool=app.state.meta_pool,
+            embedder=app.state.embedder,
+            db_name=DB_NAME,
+            user_question=user_request.prompt,
+            top_k=user_request.top_k,
+        )
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Retrieval error: {e}")
+
+    print(f"Retrieved tables: {table_names}")
+
+    # 2. Generate SQL
+    system_prompt = f"""You are an expert PostgreSQL query generator.
+Your job is to generate a SQL query that fetches exactly what the user asks for.
+
+Here is the relevant database schema:
+
+{ddl_context}
+
+Output rules (MANDATORY):
+- Output must be plain SQL only — no markdown, no explanation.
+- Do NOT use ``` or ```sql.
+- The first word MUST be SELECT, INSERT, UPDATE, or DELETE.
+- The last character MUST be a semicolon (;).
+- Return NOTHING except the SQL query itself.
+
+EXAMPLE:
+User: "Show Mirzə Abbaszadə's registered address and LinkedIn."
+Output: SELECT reg_addr, linkedin FROM employee WHERE first_name = 'Mirzə' AND last_name = 'Abbaszadə';"""
 
     try:
-        starting_time = time.time()
-        print("Generating response according to the given question. . .")
-        llm_response = client.chat.completions.create(
-            model=model_name,
+        response = llm_client.chat.completions.create(
+            model=LLM_MODEL,
             messages=[
-                {
-                    "role": "system",
-                    "content": f"""
-                    You are an expert PostgreSQL query generator. Your job is to generate the SQL Query 
-                    that fetches the relevant data that the user wants. Here is the database structure:
-                    {ddl_context}.
-        
-                    Output formats rules (MANDATORY):
-                    - Output must be a single-line or multi-line plain text SQL query.
-                    - Do NOT use ``` or ```sql or any markdown.
-                    - Do NOT wrap the output in quotes.
-                    - The first character of the output MUST be SELECT, INSERT, UPDATE, or DELETE.
-                    - The last character MUST be a semicolon (;).
-                    - Return NOTHING except the SQL query itself.
-
-                    EXAMPLE:
-                    User: "Please provide Mirzə Abbaszadə's registered address and LinkedIn address."
-                    Output: SELECT reg_addr, linkedin FROM employee WHERE first_name = 'Mirzə' AND last_name = 'Abbaszadə';
-                        """
-                },
-                {
-                    "role": "user",
-                    "content": user_request.prompt
-                }
+                {"role": "system", "content": system_prompt},
+                {"role": "user",   "content": user_request.prompt},
             ],
-            temperature=0.1
+            temperature=0.1,
+            extra_body={"chat_template_kwargs": {"enable_thinking": False}},
         )
-        
-        processing_time = time.time() - starting_time
-        print("Response was generated successfully!")
-        
     except Exception as e:
-        raise HTTPException(status_code=503, detail=f"An error occurred when generating a response: {e}")
+        raise HTTPException(status_code=503, detail=f"LLM error: {e}")
 
-    sql_query = llm_response.choices[0].message.content
-    sql_query = format_sql(text=sql_query)
+    sql = format_sql(response.choices[0].message.content or "")
 
-    if not sql_query.upper().startswith("SELECT"):
-        raise HTTPException(status_code=400, detail="Only SELECT queries are allowed!")
+    if not sql.upper().startswith("SELECT"):
+        raise HTTPException(status_code=400, detail="Only SELECT queries are allowed.")
 
-    data = await execute_query(sql_query=sql_query)
-    
+    # 3. Execute
+    data = await execute_query(app.state.db_pool, sql)
+
     return {
-        "success": True,
-        "message": "Query is generated successfully!",
-        "processing_time": processing_time,
-        "original_prompt": user_request.prompt,
-        "generated_sql": sql_query,
-        "data": data
+        "success":          True,
+        "processing_time":  round(time.time() - t_start, 2),
+        "original_prompt":  user_request.prompt,
+        "retrieved_tables": table_names,
+        "generated_sql":    sql,
+        "data":             data,
     }
-
-    
-
-
-
-    
-    
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-        
