@@ -40,7 +40,7 @@ from description_embedder.embedder import Embedder
 def load_tables(conn, db_name: str) -> list[dict]:
     """Return all table_metadata rows for the given registered database."""
     query = """
-        SELECT tm.id, tm.table_name, tm.schema_name, tm.columns_info
+        SELECT tm.id, tm.table_name, tm.schema_name, tm.columns_info, tm.table_description
         FROM table_metadata tm
         JOIN registered_databases rd ON rd.id = tm.db_id
         WHERE rd.db_name = %(db_name)s
@@ -155,7 +155,7 @@ def run(env_path: str = DEFAULT_ENV_PATH, db_name: str = None) -> None:
         col_fk_map   = col_fk_maps.get(table_name, {})
         table_related = related.get(table_name, [])
 
-        table_desc = generate_table_description(table_name)
+        table_desc = row['table_description'] or generate_table_description(table_name)
         text       = build_embedding_text(
             table_name=table_name,
             table_description=table_desc,

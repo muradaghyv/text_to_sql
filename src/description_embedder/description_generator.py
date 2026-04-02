@@ -248,7 +248,7 @@ def build_embedding_text(
             flags.append("NOT NULL")
 
         flag_str = f" [{', '.join(flags)}]" if flags else ""
-        col_desc = describe_column(col, col_fk_map)
+        col_desc = col.get('description') or describe_column(col, col_fk_map)
         lines.append(f"  {col['name']} ({col['data_type']}){flag_str}: {col_desc}")
 
     if related_tables:
@@ -268,6 +268,6 @@ def enrich_columns_with_descriptions(
     enriched = []
     for col in columns:
         enriched_col = dict(col)
-        enriched_col['description'] = describe_column(col, col_fk_map)
+        enriched_col['description'] = col.get('description') or describe_column(col, col_fk_map)
         enriched.append(enriched_col)
     return enriched
