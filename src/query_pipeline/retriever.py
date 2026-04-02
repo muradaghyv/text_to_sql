@@ -76,6 +76,32 @@ async def expand_fk_neighbors(
     return {r["neighbor"] for r in rows}
 
 
+# ── Two-hop bridge expansion ─────────────────────────────────────────────────
+
+async def expand_two_hop_bridges(
+    meta_pool,
+    db_name: str,
+    table_names: list[str],
+) -> set[str]:
+    """
+    For each table in table_names, find bridge tables from pre-computed
+    two-hop paths where that table appears as table_a or table_b.
+
+    Example: if 'employee' and 'orders' are retrieved, and the path
+    employee ──[contracts]── orders exists, 'contracts' is returned.
+    """
+    query = """
+        SELECT DISTINCT thp.bridge_table
+        FROM two_hop_paths thp
+        JOIN registered_databases rd ON rd.id = thp.db_id
+        WHERE rd.db_name = $1
+          AND (thp.table_a = ANY($2) OR thp.table_b = ANY($2));
+    """
+    async with meta_pool.acquire() as conn:
+        rows = await conn.fetch(query, db_name, table_names)
+    return {r["bridge_table"] for r in rows}
+
+
 # ── Load metadata for a specific set of tables ───────────────────────────────
 
 async def load_tables_by_name(
@@ -163,15 +189,18 @@ async def retrieve_context(
 
     # 3. FK expansion — add direct neighbors
     neighbors = await expand_fk_neighbors(meta_pool, db_name, top_names)
-    neighbor_names = list(neighbors - set(top_names))
 
-    # 4. Load full metadata for FK neighbors (top tables already have it)
-    neighbor_tables = []
-    if neighbor_names:
-        neighbor_tables = await load_tables_by_name(meta_pool, db_name, neighbor_names)
+    # 4. Two-hop bridge expansion — add bridge tables connecting retrieved tables
+    bridges = await expand_two_hop_bridges(meta_pool, db_name, top_names)
 
-    # 5. Build context — top tables first (most relevant), neighbors after
-    all_tables = top_tables + neighbor_tables
+    # 5. Load full metadata for all extra tables
+    extra_names = list((neighbors | bridges) - set(top_names))
+    extra_tables = []
+    if extra_names:
+        extra_tables = await load_tables_by_name(meta_pool, db_name, extra_names)
+
+    # 6. Build context — top tables first (most relevant), extras after
+    all_tables = top_tables + extra_tables
     ddl_context = build_ddl_context(all_tables)
     all_names = [t["table_name"] for t in all_tables]
 
