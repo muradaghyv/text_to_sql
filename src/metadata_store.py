@@ -26,6 +26,7 @@ import os
 
 from schema_extractor.ddl_extractor import TableDDL
 from schema_extractor.fk_extractor import FKRelationship
+from schema_extractor.path_builder import TwoHopPath
 
 _PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 _DEFAULT_ENV = os.path.join(_PROJECT_ROOT, "env", ".env")
@@ -171,4 +172,33 @@ def store_fk_relationships(
                 "target_column":     fk.target_column,
                 "relationship_type": fk.relationship_type,
             })
+    conn.commit()
+
+
+def store_two_hop_paths(
+    conn: psycopg2.extensions.connection,
+    db_id: int,
+    paths: list[TwoHopPath],
+) -> None:
+    """
+    Bulk-insert two-hop paths into two_hop_paths.
+    Clears existing rows for this db_id before inserting so re-running is safe.
+    """
+    with conn.cursor() as cur:
+        cur.execute("DELETE FROM two_hop_paths WHERE db_id = %(db_id)s", {"db_id": db_id})
+        cur.executemany(
+            """
+            INSERT INTO two_hop_paths (db_id, table_a, bridge_table, table_b)
+            VALUES (%(db_id)s, %(table_a)s, %(bridge_table)s, %(table_b)s)
+            """,
+            [
+                {
+                    "db_id":        db_id,
+                    "table_a":      p.table_a,
+                    "bridge_table": p.bridge_table,
+                    "table_b":      p.table_b,
+                }
+                for p in paths
+            ],
+        )
     conn.commit()

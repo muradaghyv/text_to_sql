@@ -36,6 +36,7 @@ from metadata_store import (
     register_database,
     store_table_metadata,
     store_fk_relationships,
+    store_two_hop_paths,
 )
 
 
@@ -62,7 +63,7 @@ def run(env_path: str = DEFAULT_ENV_PATH) -> None:
     fks = extract_foreign_keys(target_conn)
     print(f"      Found {len(fks)} FK relationship(s).")
 
-    # ── Step 4: compute two-hop paths (informational) ───────────────────────
+    # ── Step 4: compute two-hop paths ───────────────────────────────────────
     print("[4/6] Computing two-hop paths from FK graph...")
     adjacency = build_adjacency(fks)
     two_hop_paths = find_two_hop_paths(adjacency)
@@ -93,6 +94,9 @@ def run(env_path: str = DEFAULT_ENV_PATH) -> None:
 
     print(f"      Storing {len(fks)} FK relationship(s)...")
     store_fk_relationships(conn=meta_conn, db_id=db_id, fks=fks)
+
+    print(f"      Storing {len(two_hop_paths)} two-hop path(s)...")
+    store_two_hop_paths(conn=meta_conn, db_id=db_id, paths=two_hop_paths)
 
     target_conn.close()
     meta_conn.close()
