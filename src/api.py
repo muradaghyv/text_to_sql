@@ -147,6 +147,9 @@ EXAMPLE:
 User: "Show Mirzə Abbaszadə's registered address and LinkedIn."
 Output: SELECT reg_addr, linkedin FROM employee WHERE first_name = 'Mirzə' AND last_name = 'Abbaszadə';"""
 
+    full_prompt = system_prompt + "\n\nUser: " + user_request.prompt
+    print(f"[PROMPT] chars={len(full_prompt)}  tokens≈{len(full_prompt)//4}")
+
     try:
         response = llm_client.chat.completions.create(
             model=LLM_MODEL,
@@ -160,6 +163,7 @@ Output: SELECT reg_addr, linkedin FROM employee WHERE first_name = 'Mirzə' AND 
     except Exception as e:
         raise HTTPException(status_code=503, detail=f"LLM error: {e}")
 
+    print(f"[TOKENS] prompt={response.usage.prompt_tokens}  completion={response.usage.completion_tokens}")
     sql = format_sql(response.choices[0].message.content or "")
 
     if not sql.upper().startswith("SELECT"):
