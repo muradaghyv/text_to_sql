@@ -82,9 +82,12 @@ LLM_MODEL    = "your-model-name"
 Apply these against your **metadata DB** in order:
 
 ```bash
-psql -h <metadata-host> -U nl2sql_user -d nl2sql_metadata -f migrations/001_add_embedding_column.sql
-psql -h <metadata-host> -U nl2sql_user -d nl2sql_metadata -f migrations/002_add_two_hop_paths.sql
+psql -h <metadata-host> -U postgres -d nl2sql_metadata -f migrations/000_create_metadata_db.sql
+psql -h <metadata-host> -U postgres -d nl2sql_metadata -f migrations/001_add_embedding_column.sql
+psql -h <metadata-host> -U postgres -d nl2sql_metadata -f migrations/002_add_two_hop_paths.sql
 ```
+
+`000` must be run as a superuser (`postgres`) since it creates tables and grants privileges. `001` and `002` can also be run as `postgres` or as `nl2sql_user` once permissions are in place.
 
 ---
 
