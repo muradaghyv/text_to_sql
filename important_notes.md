@@ -46,3 +46,27 @@ WHERE tc.constraint_type = 'FOREIGN KEY';
 │                                         ↓                │
 │                              Return Results              │
 └─────────────────────────────────────────────────────────┘
+
+# Areas for Improvement
+
+## Performance
+1. **Async embedding** — BGE-M3 runs synchronously on CPU, blocking the FastAPI event loop.
+   Wrap the embedder call in `asyncio.run_in_executor` so concurrent requests don't queue behind each other.
+
+2. **Embedding cache** — identical questions re-embed unnecessarily.
+   Add an LRU cache (e.g. `functools.lru_cache`) on query vectors to skip re-embedding for repeated prompts.
+
+## Robustness
+3. **LLM retry logic** — if the generated SQL fails to execute on ERPHUB, retry once by feeding the error
+   message back to the LLM ("this query failed with error X, fix it"). Makes the system self-correcting.
+
+4. **Query validation** — validate LLM-generated SQL against the retrieved table/column names before
+   executing, using `sqlglot`. Catches hallucinated table or column names early.
+
+## Codebase
+5. **Config dataclass** — `top_k`, model name, LLM URL, and other tunables are scattered across files.
+   Centralise them in a `src/config.py` for easier tuning.
+
+6. **Retrieval tuning** — test with more varied prompts and inspect `retrieved_tables` in responses.
+   If wrong tables are retrieved, adjust `top_k` or consider adding a reranker (e.g. BGE reranker)
+   after the initial vector search.
