@@ -41,11 +41,18 @@ Your PostgreSQL DB
 
 ## Setup
 
-### 1. Install dependencies
+### 1. Create and activate the conda environment
+
+```bash
+conda create -n sql_llm python=3.12 -y
+conda activate sql_llm
+pip install -r requirements.txt
+```
+
+If you already have the `sql_llm` environment, just activate it:
 
 ```bash
 conda activate sql_llm
-pip install -r requirements.txt
 ```
 
 ### 2. Configure environment
@@ -89,6 +96,8 @@ CREATE USER nl2sql_user WITH PASSWORD 'your-metadata-db-password';
 CREATE DATABASE nl2sql_metadata OWNER nl2sql_user;
 ```
 
+> If `nl2sql_user` already exists (e.g. you are re-setting up), skip the `CREATE USER` line.
+
 Then apply the migrations in order from the **project root**:
 
 ```bash
@@ -102,9 +111,11 @@ psql -h <metadata-host> -U postgres -d nl2sql_metadata -f migrations/001_add_emb
 psql -h <metadata-host> -U postgres -d nl2sql_metadata -f migrations/002_add_two_hop_paths.sql
 ```
 
-Migration `000` must run as a superuser (`postgres`) since it creates tables and grants privileges. Migrations `001` and `002` also require superuser for `CREATE EXTENSION` and `ALTER TABLE`.
+Migrations `000` and `001` must run as superuser (`postgres`): `000` creates tables and grants privileges; `001` runs `CREATE EXTENSION` and `ALTER TABLE`. Migration `002` only creates tables and can run as either superuser or `nl2sql_user`.
 
 > **Note:** `pgvector` must be installed on the metadata DB PostgreSQL server before running migration `001`. On Ubuntu: `apt install postgresql-16-pgvector` (adjust version to match yours).
+
+> **Note:** Migration `000` includes grant statements targeting a database named `postgres`. These are irrelevant to your actual target DB and can be ignored — the tool connects to your target DB using the credentials you provide in `.env`, not as `nl2sql_user`. Just ensure that `POSTGRES_USER` in `.env` has `SELECT` access on all tables in your target DB's `public` schema.
 
 ---
 
@@ -115,6 +126,8 @@ Run these three steps once for each database you want to make queryable. Re-run 
 ### Step 1 — Extract schema
 
 Connects to your target database and stores table DDL, column metadata, FK relationships, and two-hop FK paths into the metadata DB.
+
+Run from the **project root** (the directory containing `src/`):
 
 ```bash
 conda activate sql_llm
@@ -242,11 +255,11 @@ curl -X POST http://localhost:8080/generate \
 
 ## Re-indexing
 
-If you add tables, change column names, or want to refresh descriptions, re-run all three steps from the project root:
+If you add tables, change column names, or want to refresh descriptions, re-run all three steps. Start from the **project root**:
 
 ```bash
 conda activate sql_llm
-python -m src.run_setup
+python -m src.run_setup          # must be run from project root
 cd src
 python run_llm_descriptions.py http://your-llm-host:8000/v1
 python run_embedder.py
