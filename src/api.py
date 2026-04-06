@@ -12,6 +12,7 @@ from dotenv import load_dotenv
 
 from description_embedder.embedder import Embedder
 from query_pipeline.retriever import retrieve_context
+from query_pipeline.sql_validator import SQLValidationError, validate_sql
 
 # ── Config ────────────────────────────────────────────────────────────────────
 
@@ -166,10 +167,13 @@ Output: SELECT reg_addr, linkedin FROM employee WHERE first_name = 'Mirzə' AND 
     print(f"[TOKENS] prompt={response.usage.prompt_tokens}  completion={response.usage.completion_tokens}")
     sql = format_sql(response.choices[0].message.content or "")
 
-    if not sql.upper().startswith("SELECT"):
-        raise HTTPException(status_code=400, detail="Only SELECT queries are allowed.")
+    # 3. Validate SQL before touching the target DB
+    try:
+        validate_sql(sql, allowed_tables=table_names)
+    except SQLValidationError as e:
+        raise HTTPException(status_code=400, detail=f"SQL validation failed: {e}")
 
-    # 3. Execute
+    # 4. Execute
     data = await execute_query(app.state.db_pool, sql)
 
     return {
