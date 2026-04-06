@@ -17,5 +17,8 @@ openai==1.82.0               # OpenAI-compatible client (used to call vLLM endpo
 sentence-transformers==5.3.0 # runs BAAI/bge-m3 locally, compatible with transformers 5.x
 pgvector==0.4.2              # psycopg2 adapter for pgvector column type
 
+# ── SQL parsing / validation ─────────────────────────────────────────────────
+sqlglot==26.17.0              # SQL parser used to validate LLM-generated queries
+
 # ── Testing ───────────────────────────────────────────────────────────────────
 pytest==9.0.2
