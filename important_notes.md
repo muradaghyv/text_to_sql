@@ -19,6 +19,14 @@ FROM
 WHERE tc.constraint_type = 'FOREIGN KEY';
 ```
 
+## RunPod instructions
+**Docker Image**
+* `vllm/vllm-openai:v0.11.0`
+
+**Start command**
+* For 1 GPU: 
+   * `--model cyankiwi/Qwen3-30B-A3B-Instruct-2507-AWQ-4bit --trust-remote-code --max-model-len 24000 --gpu-memory-utilization 0.9 --port 8000 --host 0.0.0.0`
+
 # Roadmap for RAG Implementation
 * The following schema is approximately shows how process will be performed: 
 ┌─────────────────────────────────────────────────────────┐
