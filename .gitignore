@@ -1,5 +1,7 @@
 env/.env
 
+logs/
+
 *.sql
 !migrations/*.sql
 

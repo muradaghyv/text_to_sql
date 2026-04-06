@@ -11,8 +11,11 @@ from openai import OpenAI
 from dotenv import load_dotenv
 
 from description_embedder.embedder import Embedder
+from logger import get_logger
 from query_pipeline.retriever import retrieve_context
 from query_pipeline.sql_validator import SQLValidationError, validate_sql
+
+logger = get_logger(__name__)
 
 # ── Config ────────────────────────────────────────────────────────────────────
 
@@ -53,32 +56,32 @@ llm_client = OpenAI(base_url=LLM_BASE_URL, api_key="EMPTY")
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    print("Starting up...")
+    logger.info("Starting up...")
 
     # Target DB pool
     app.state.db_pool = await asyncpg.create_pool(
         host=DB_HOST, port=DB_PORT,
         user=DB_USER, password=DB_PASSWORD, database=DB_NAME,
     )
-    print(f"  Target DB pool ready ({DB_NAME})")
+    logger.info("Target DB pool ready (%s)", DB_NAME)
 
     # Metadata DB pool
     app.state.meta_pool = await asyncpg.create_pool(
         host=META_HOST, port=META_PORT,
         user=META_USER, password=META_PASSWORD, database=META_DB_NAME,
     )
-    print(f"  Metadata DB pool ready ({META_DB_NAME})")
+    logger.info("Metadata DB pool ready (%s)", META_DB_NAME)
 
     # Embedder (loads BGE-M3 once)
-    print("  Loading BGE-M3 embedder...")
+    logger.info("Loading BGE-M3 embedder...")
     app.state.embedder = Embedder()
-    print("  Embedder ready.")
+    logger.info("Embedder ready.")
 
     yield
 
     await app.state.db_pool.close()
     await app.state.meta_pool.close()
-    print("Shutdown complete.")
+    logger.info("Shutdown complete.")
 
 
 app = FastAPI(lifespan=lifespan)
@@ -109,8 +112,10 @@ def call_llm(messages: list[dict]) -> str:
             extra_body={"chat_template_kwargs": {"enable_thinking": False}},
         )
     except Exception as e:
+        logger.error("LLM error: %s", e, exc_info=True)
         raise HTTPException(status_code=503, detail=f"LLM error: {e}")
-    print(f"[TOKENS] prompt={response.usage.prompt_tokens}  completion={response.usage.completion_tokens}")
+    logger.debug("[TOKENS] prompt=%d  completion=%d",
+                 response.usage.prompt_tokens, response.usage.completion_tokens)
     return format_sql(response.choices[0].message.content or "")
 
 
@@ -120,6 +125,7 @@ async def execute_query(pool, sql: str) -> list[dict]:
             rows = await conn.fetch(sql)
             return [dict(r) for r in rows]
         except Exception as e:
+            logger.error("Database error: %s | sql=%s", e, sql, exc_info=True)
             raise HTTPException(status_code=500, detail=f"Database error: {e}")
 
 
@@ -139,9 +145,10 @@ async def generate_answer(user_request: UserRequest):
             top_k=user_request.top_k,
         )
     except Exception as e:
+        logger.error("Retrieval error: %s", e, exc_info=True)
         raise HTTPException(status_code=500, detail=f"Retrieval error: {e}")
 
-    print(f"Retrieved tables: {table_names}")
+    logger.info("Retrieved tables: %s", table_names)
 
     # 2. Build system prompt and generate SQL
     system_prompt = f"""You are an expert PostgreSQL query generator.
@@ -163,7 +170,7 @@ User: "Show Mirzə Abbaszadə's registered address and LinkedIn."
 Output: SELECT reg_addr, linkedin FROM employee WHERE first_name = 'Mirzə' AND last_name = 'Abbaszadə';"""
 
     full_prompt = system_prompt + "\n\nUser: " + user_request.prompt
-    print(f"[PROMPT] chars={len(full_prompt)}  tokens≈{len(full_prompt)//4}")
+    logger.debug("[PROMPT] chars=%d  tokens≈%d", len(full_prompt), len(full_prompt) // 4)
 
     messages = [
         {"role": "system", "content": system_prompt},
@@ -177,6 +184,7 @@ Output: SELECT reg_addr, linkedin FROM employee WHERE first_name = 'Mirzə' AND 
     try:
         validate_sql(sql, allowed_tables=table_names)
     except SQLValidationError as e:
+        logger.warning("SQL validation failed: %s | sql=%s", e, sql)
         raise HTTPException(status_code=400, detail=f"SQL validation failed: {e}")
 
     # 4. Execute — retry once on failure
@@ -184,7 +192,8 @@ Output: SELECT reg_addr, linkedin FROM employee WHERE first_name = 'Mirzə' AND 
     try:
         data = await execute_query(app.state.db_pool, sql)
     except HTTPException as first_err:
-        print(f"[RETRY] SQL execution failed: {first_err.detail}. Retrying with error context...")
+        logger.warning("[RETRY] SQL execution failed: %s | sql=%s — retrying with error context",
+                       first_err.detail, sql)
         retry_messages = messages + [
             {"role": "assistant", "content": sql},
             {"role": "user",      "content": (
@@ -196,9 +205,14 @@ Output: SELECT reg_addr, linkedin FROM employee WHERE first_name = 'Mirzə' AND 
         try:
             validate_sql(sql, allowed_tables=table_names)
         except SQLValidationError as e:
+            logger.error("SQL validation failed on retry: %s | sql=%s", e, sql)
             raise HTTPException(status_code=400, detail=f"SQL validation failed on retry: {e}")
         data = await execute_query(app.state.db_pool, sql)
         retried = True
+        logger.info("[RETRY] Retry succeeded.")
+
+    logger.info("Request completed in %.2fs | retried=%s | sql=%s",
+                time.time() - t_start, retried, sql)
 
     return {
         "success":          True,
