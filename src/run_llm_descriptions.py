@@ -26,6 +26,7 @@ from dotenv import load_dotenv
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DEFAULT_ENV_PATH = os.path.join(PROJECT_ROOT, "env", ".env")
 
+from logger import get_logger
 from metadata_store import get_metadata_connection
 from description_embedder.llm_describer import LLMDescriber
 
@@ -96,23 +97,25 @@ def run(
     db_name: str = None,
     env_path: str = DEFAULT_ENV_PATH,
 ) -> None:
+    logger = get_logger(__name__)
     load_dotenv(env_path)
 
     if db_name is None:
         db_name = os.getenv("POSTGRES_DB_NAME")
 
-    print(f"[1/3] Connecting to metadata DB...")
-    conn = get_metadata_connection(env_path=env_path)
+    logger.info("[1/3] Connecting to metadata DB...")
+    try:
+        conn = get_metadata_connection(env_path=env_path)
+    except Exception as e:
+        logger.error("Failed to connect to metadata DB: %s", e, exc_info=True)
+        raise
 
-    print(f"[2/3] Loading tables for '{db_name}'...")
+    logger.info("[2/3] Loading tables for '%s'...", db_name)
     tables      = load_tables(conn, db_name)
     col_fk_maps = load_col_fk_maps(conn, db_name)
-    print(f"      {len(tables)} tables loaded.")
+    logger.info("      %d tables loaded.", len(tables))
 
-    print(f"[3/3] Generating descriptions via LLM...")
-    print(f"      Endpoint : {llm_base_url}")
-    print(f"      Model    : {model}")
-
+    logger.info("[3/3] Generating descriptions via LLM — endpoint: %s | model: %s", llm_base_url, model)
     describer = LLMDescriber(base_url=llm_base_url, model=model)
 
     success = 0
@@ -123,11 +126,15 @@ def run(
         columns    = row['columns_info']
         col_fk_map = col_fk_maps.get(table_name, {})
 
-        print(f"  [{i+1:>3}/{len(tables)}] {table_name}", end=" ", flush=True)
+        try:
+            result = describer.describe_table(table_name, columns, col_fk_map)
+        except Exception as e:
+            logger.error("[%3d/%d] %s — LLM call failed: %s", i + 1, len(tables), table_name, e, exc_info=True)
+            skipped += 1
+            continue
 
-        result = describer.describe_table(table_name, columns, col_fk_map)
         if result is None:
-            print("→ skipped")
+            logger.warning("[%3d/%d] %s — skipped (no result)", i + 1, len(tables), table_name)
             skipped += 1
             continue
 
@@ -142,17 +149,14 @@ def run(
             enriched.append(enriched_col)
 
         update_descriptions(conn, row['id'], table_desc, enriched)
-        print("→ ok")
+        logger.info("[%3d/%d] %s — ok", i + 1, len(tables), table_name)
         success += 1
 
     conn.close()
-
-    print("\n── LLM description generation complete ──────────────────")
-    print(f"  Database  : {db_name}")
-    print(f"  Success   : {success}")
-    print(f"  Skipped   : {skipped}")
-    print(f"  Next step : python run_embedder.py")
-    print("─────────────────────────────────────────────────────────")
+    logger.info(
+        "LLM description generation complete — DB: %s | success: %d | skipped: %d",
+        db_name, success, skipped,
+    )
 
 
 if __name__ == "__main__":

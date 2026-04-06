@@ -26,6 +26,7 @@ from dotenv import load_dotenv
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DEFAULT_ENV_PATH = os.path.join(PROJECT_ROOT, "env", ".env")
 
+from logger import get_logger
 from metadata_store import get_metadata_connection
 from description_embedder.description_generator import (
     generate_table_description,
@@ -128,31 +129,36 @@ def update_table_row(
 # ── Main ──────────────────────────────────────────────────────────────────────
 
 def run(env_path: str = DEFAULT_ENV_PATH, db_name: str = None) -> None:
+    logger = get_logger(__name__)
     load_dotenv(env_path)
 
     if db_name is None:
         db_name = os.getenv("POSTGRES_DB_NAME")
 
     # ── Step 1: load metadata ────────────────────────────────────────────────
-    print(f"[1/4] Connecting to metadata DB...")
-    conn = get_metadata_connection(env_path=env_path)
+    logger.info("[1/4] Connecting to metadata DB...")
+    try:
+        conn = get_metadata_connection(env_path=env_path)
+    except Exception as e:
+        logger.error("Failed to connect to metadata DB: %s", e, exc_info=True)
+        raise
 
-    print(f"[2/4] Loading tables and FK relationships for '{db_name}'...")
+    logger.info("[2/4] Loading tables and FK relationships for '%s'...", db_name)
     tables      = load_tables(conn, db_name)
     col_fk_maps = load_col_fk_maps(conn, db_name)
     related     = load_related_tables(conn, db_name)
-    print(f"      {len(tables)} tables loaded.")
+    logger.info("      %d tables loaded.", len(tables))
 
     # ── Step 2: build text blobs ─────────────────────────────────────────────
-    print("[3/4] Building description text blobs...")
+    logger.info("[3/4] Building description text blobs...")
     texts            = []
     descriptions     = []
     enriched_cols    = []
 
     for row in tables:
-        table_name   = row['table_name']
-        columns      = row['columns_info']          # list[dict] — psycopg2 parses JSONB
-        col_fk_map   = col_fk_maps.get(table_name, {})
+        table_name    = row['table_name']
+        columns       = row['columns_info']
+        col_fk_map    = col_fk_maps.get(table_name, {})
         table_related = related.get(table_name, [])
 
         table_desc = row['table_description'] or generate_table_description(table_name)
@@ -169,34 +175,35 @@ def run(env_path: str = DEFAULT_ENV_PATH, db_name: str = None) -> None:
         descriptions.append(table_desc)
         enriched_cols.append(enriched)
 
-    print(f"      Built {len(texts)} text blobs.")
+    logger.info("      Built %d text blobs.", len(texts))
 
     # ── Step 3: embed ────────────────────────────────────────────────────────
-    print("[4/4] Generating embeddings with BAAI/bge-m3...")
+    logger.info("[4/4] Generating embeddings with BAAI/bge-m3...")
     embedder   = Embedder()
     embeddings = embedder.embed(texts)
-    print(f"      {len(embeddings)} embeddings generated.")
+    logger.info("      %d embeddings generated.", len(embeddings))
 
     # ── Step 4: write back ───────────────────────────────────────────────────
-    print("      Writing descriptions and embeddings to metadata DB...")
+    logger.info("      Writing descriptions and embeddings to metadata DB...")
     for i, row in enumerate(tables):
-        update_table_row(
-            conn,
-            table_id        = row['id'],
-            description     = descriptions[i],
-            enriched_columns= enriched_cols[i],
-            embedding       = embeddings[i],
-        )
-        print(f"        [{i+1:>3}/{len(tables)}] {row['table_name']}")
+        try:
+            update_table_row(
+                conn,
+                table_id         = row['id'],
+                description      = descriptions[i],
+                enriched_columns = enriched_cols[i],
+                embedding        = embeddings[i],
+            )
+            logger.debug("        [%3d/%d] %s", i + 1, len(tables), row['table_name'])
+        except Exception as e:
+            logger.error("        Failed on table '%s': %s", row['table_name'], e, exc_info=True)
+            raise
 
     conn.close()
-
-    print("\n── Phase 3 complete ─────────────────────────────────")
-    print(f"  Database        : {db_name}")
-    print(f"  Tables embedded : {len(tables)}")
-    print(f"  Embedding dim   : 1024")
-    print(f"  Model           : BAAI/bge-m3")
-    print("─────────────────────────────────────────────────────")
+    logger.info(
+        "Embedding complete — DB: %s | tables embedded: %d | dim: 1024 | model: BAAI/bge-m3",
+        db_name, len(tables),
+    )
 
 
 if __name__ == "__main__":
