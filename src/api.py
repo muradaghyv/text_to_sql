@@ -100,6 +100,20 @@ def format_sql(text: str) -> str:
     return text
 
 
+def call_llm(messages: list[dict]) -> str:
+    try:
+        response = llm_client.chat.completions.create(
+            model=LLM_MODEL,
+            messages=messages,
+            temperature=0.1,
+            extra_body={"chat_template_kwargs": {"enable_thinking": False}},
+        )
+    except Exception as e:
+        raise HTTPException(status_code=503, detail=f"LLM error: {e}")
+    print(f"[TOKENS] prompt={response.usage.prompt_tokens}  completion={response.usage.completion_tokens}")
+    return format_sql(response.choices[0].message.content or "")
+
+
 async def execute_query(pool, sql: str) -> list[dict]:
     async with pool.acquire() as conn:
         try:
@@ -129,7 +143,7 @@ async def generate_answer(user_request: UserRequest):
 
     print(f"Retrieved tables: {table_names}")
 
-    # 2. Generate SQL
+    # 2. Build system prompt and generate SQL
     system_prompt = f"""You are an expert PostgreSQL query generator.
 Your job is to generate a SQL query that fetches exactly what the user asks for.
 
@@ -151,21 +165,13 @@ Output: SELECT reg_addr, linkedin FROM employee WHERE first_name = 'Mirzə' AND 
     full_prompt = system_prompt + "\n\nUser: " + user_request.prompt
     print(f"[PROMPT] chars={len(full_prompt)}  tokens≈{len(full_prompt)//4}")
 
-    try:
-        response = llm_client.chat.completions.create(
-            model=LLM_MODEL,
-            messages=[
-                {"role": "system", "content": system_prompt},
-                {"role": "user",   "content": user_request.prompt},
-            ],
-            temperature=0.1,
-            extra_body={"chat_template_kwargs": {"enable_thinking": False}},
-        )
-    except Exception as e:
-        raise HTTPException(status_code=503, detail=f"LLM error: {e}")
+    messages = [
+        {"role": "system", "content": system_prompt},
+        {"role": "user",   "content": user_request.prompt},
+    ]
 
-    print(f"[TOKENS] prompt={response.usage.prompt_tokens}  completion={response.usage.completion_tokens}")
-    sql = format_sql(response.choices[0].message.content or "")
+    # 2. Generate SQL
+    sql = call_llm(messages)
 
     # 3. Validate SQL before touching the target DB
     try:
@@ -173,8 +179,26 @@ Output: SELECT reg_addr, linkedin FROM employee WHERE first_name = 'Mirzə' AND 
     except SQLValidationError as e:
         raise HTTPException(status_code=400, detail=f"SQL validation failed: {e}")
 
-    # 4. Execute
-    data = await execute_query(app.state.db_pool, sql)
+    # 4. Execute — retry once on failure
+    retried = False
+    try:
+        data = await execute_query(app.state.db_pool, sql)
+    except HTTPException as first_err:
+        print(f"[RETRY] SQL execution failed: {first_err.detail}. Retrying with error context...")
+        retry_messages = messages + [
+            {"role": "assistant", "content": sql},
+            {"role": "user",      "content": (
+                f"That query failed with this error:\n{first_err.detail}\n\n"
+                "Fix the SQL and return only the corrected query."
+            )},
+        ]
+        sql = call_llm(retry_messages)
+        try:
+            validate_sql(sql, allowed_tables=table_names)
+        except SQLValidationError as e:
+            raise HTTPException(status_code=400, detail=f"SQL validation failed on retry: {e}")
+        data = await execute_query(app.state.db_pool, sql)
+        retried = True
 
     return {
         "success":          True,
@@ -182,5 +206,6 @@ Output: SELECT reg_addr, linkedin FROM employee WHERE first_name = 'Mirzə' AND 
         "original_prompt":  user_request.prompt,
         "retrieved_tables": table_names,
         "generated_sql":    sql,
+        "retried":          retried,
         "data":             data,
     }
