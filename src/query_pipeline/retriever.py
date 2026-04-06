@@ -11,6 +11,7 @@ Pipeline:
   3. load_tables_by_name()  — fetch full metadata for the expanded set
   4. build_ddl_context()    — format DDL + descriptions into a prompt-ready string
 """
+import asyncio
 import json
 
 
@@ -179,8 +180,9 @@ async def retrieve_context(
         ddl_context   — formatted string ready for the LLM system prompt
         table_names   — list of all table names included in the context
     """
-    # 1. Embed the user question
-    vectors = embedder.embed([user_question])
+    # 1. Embed the user question (offloaded to thread pool — BGE-M3 is CPU-bound)
+    loop = asyncio.get_event_loop()
+    vectors = await loop.run_in_executor(None, embedder.embed, [user_question])
     query_vector = vectors[0]
 
     # 2. Vector search — top-K most similar tables
