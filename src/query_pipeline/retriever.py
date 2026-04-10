@@ -164,6 +164,29 @@ def build_ddl_context(tables: list[dict]) -> str:
     return "\n\n".join(blocks)
 
 
+# ── Relevance check ───────────────────────────────────────────────────────────
+
+async def embed_question(embedder, question: str) -> list[float]:
+    """Embed a question using BGE-M3, offloaded to thread pool."""
+    loop = asyncio.get_event_loop()
+    vectors = await loop.run_in_executor(None, embedder.embed, [question])
+    return vectors[0]
+
+
+async def check_relevance(
+    meta_pool,
+    db_name: str,
+    query_vector: list[float],
+) -> float:
+    """
+    Return the highest cosine similarity between the query vector and any
+    table embedding in the DB. Used to reject off-topic questions before
+    running the full retrieval pipeline.
+    """
+    rows = await vector_search(meta_pool, db_name, query_vector, top_k=1)
+    return rows[0]["similarity"] if rows else 0.0
+
+
 # ── Full retrieval pipeline ───────────────────────────────────────────────────
 
 async def retrieve_context(
@@ -173,6 +196,7 @@ async def retrieve_context(
     user_question: str,
     top_k: int = 5,
     allowed_tables: set[str] | None = None,
+    query_vector: list[float] | None = None,
 ) -> tuple[str, list[str]]:
     """
     End-to-end retrieval: embed question → vector search → FK expand → build context.
@@ -180,14 +204,16 @@ async def retrieve_context(
     If allowed_tables is provided, only tables in that set are included in the
     returned context and table list (access control filter).
 
+    If query_vector is provided, the embedding step is skipped (avoids re-embedding
+    when the vector was already computed for a relevance check).
+
     Returns:
         ddl_context   — formatted string ready for the LLM system prompt
         table_names   — list of all table names included in the context
     """
-    # 1. Embed the user question (offloaded to thread pool — BGE-M3 is CPU-bound)
-    loop = asyncio.get_event_loop()
-    vectors = await loop.run_in_executor(None, embedder.embed, [user_question])
-    query_vector = vectors[0]
+    # 1. Embed the user question (skipped if pre-computed vector is provided)
+    if query_vector is None:
+        query_vector = await embed_question(embedder, user_question)
 
     # 2. Vector search — top-K most similar tables
     top_tables = await vector_search(meta_pool, db_name, query_vector, top_k=top_k)
