@@ -77,6 +77,12 @@ async def lifespan(app: FastAPI):
     )
     logger.info("Metadata DB pool ready (%s)", META_DB_NAME)
 
+    # Cache db_name → db_id mapping from registered_databases
+    async with app.state.meta_pool.acquire() as conn:
+        rows = await conn.fetch("SELECT id, db_name FROM registered_databases")
+    app.state.db_ids = {r["db_name"]: r["id"] for r in rows}
+    logger.info("Loaded db_id map: %s", app.state.db_ids)
+
     # Embedder (loads BGE-M3 once)
     logger.info("Loading BGE-M3 embedder...")
     app.state.embedder = Embedder()
@@ -96,6 +102,7 @@ app = FastAPI(lifespan=lifespan)
 # ── Request / response models ─────────────────────────────────────────────────
 
 class UserRequest(BaseModel):
+    emp_id: int        # employee ID — used to enforce table-level access control
     db_name: str       # must match a db_name in registered_databases
     prompt: str
     top_k: int = 5     # number of tables to retrieve via vector search
@@ -126,6 +133,18 @@ def call_llm(messages: list[dict]) -> str:
     return format_sql(response.choices[0].message.content or "")
 
 
+async def get_allowed_tables(meta_pool, emp_id: int, db_id: int) -> set[str]:
+    """Return the set of table names this employee is allowed to read."""
+    query = """
+        SELECT table_name
+        FROM emp_table_access
+        WHERE emp_id = $1 AND db_id = $2;
+    """
+    async with meta_pool.acquire() as conn:
+        rows = await conn.fetch(query, emp_id, db_id)
+    return {r["table_name"] for r in rows}
+
+
 async def execute_query(pool, sql: str) -> list[dict]:
     async with pool.acquire() as conn:
         try:
@@ -143,13 +162,23 @@ async def generate_answer(user_request: UserRequest):
     t_start = time.time()
 
     db_name = user_request.db_name
+    emp_id  = user_request.emp_id
+
     if db_name not in app.state.db_pools:
         raise HTTPException(
             status_code=400,
             detail=f"Unknown db_name '{db_name}'. Registered: {list(app.state.db_pools.keys())}",
         )
 
-    # 1. Retrieve relevant schema context
+    # 1. Resolve employee's allowed tables
+    db_id = app.state.db_ids.get(db_name)
+    allowed_tables = await get_allowed_tables(app.state.meta_pool, emp_id, db_id)
+    if not allowed_tables:
+        logger.warning("Access denied — emp_id=%d has no table access for db=%s", emp_id, db_name)
+        raise HTTPException(status_code=403, detail=f"Employee {emp_id} has no table access for database '{db_name}'")
+    logger.info("emp_id=%d allowed_tables=%s", emp_id, sorted(allowed_tables))
+
+    # 3. Retrieve relevant schema context (filtered to allowed tables)
     try:
         ddl_context, table_names = await retrieve_context(
             meta_pool=app.state.meta_pool,
@@ -157,14 +186,19 @@ async def generate_answer(user_request: UserRequest):
             db_name=db_name,
             user_question=user_request.prompt,
             top_k=user_request.top_k,
+            allowed_tables=allowed_tables,
         )
     except Exception as e:
         logger.error("Retrieval error: %s", e, exc_info=True)
         raise HTTPException(status_code=500, detail=f"Retrieval error: {e}")
 
-    logger.info("Retrieved tables: %s", table_names)
+    if not table_names:
+        logger.warning("Access denied — emp_id=%d: none of the retrieved tables are allowed", emp_id)
+        raise HTTPException(status_code=403, detail=f"Employee {emp_id} does not have access to the tables needed for this query")
 
-    # 2. Build system prompt and generate SQL
+    logger.info("Retrieved tables (after access filter): %s", table_names)
+
+    # 4. Build system prompt and generate SQL
     system_prompt = f"""You are an expert PostgreSQL query generator.
 Your job is to generate a SQL query that fetches exactly what the user asks for.
 
@@ -191,17 +225,17 @@ Output: SELECT reg_addr, linkedin FROM employee WHERE first_name = 'Mirzə' AND 
         {"role": "user",   "content": user_request.prompt},
     ]
 
-    # 2. Generate SQL
+    # 5. Generate SQL
     sql = call_llm(messages)
 
-    # 3. Validate SQL before touching the target DB
+    # 6. Validate SQL before touching the target DB
     try:
         validate_sql(sql, allowed_tables=table_names)
     except SQLValidationError as e:
         logger.warning("SQL validation failed: %s | sql=%s", e, sql)
         raise HTTPException(status_code=400, detail=f"SQL validation failed: {e}")
 
-    # 4. Execute — retry once on failure
+    # 7. Execute — retry once on failure
     logger.info("[EXEC] db_name=%s | sql=%s", db_name, sql)
     db_pool = app.state.db_pools[db_name]
     retried = False
@@ -233,6 +267,7 @@ Output: SELECT reg_addr, linkedin FROM employee WHERE first_name = 'Mirzə' AND 
     return {
         "success":          True,
         "processing_time":  round(time.time() - t_start, 2),
+        "emp_id":           emp_id,
         "original_prompt":  user_request.prompt,
         "retrieved_tables": table_names,
         "generated_sql":    sql,
