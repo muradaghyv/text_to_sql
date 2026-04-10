@@ -27,12 +27,6 @@ load_dotenv(ENV_PATH)
 LLM_BASE_URL = os.getenv("LLM_BASE_URL")
 LLM_MODEL    = os.getenv("LLM_MODEL")
 
-DB_HOST     = os.getenv("DATABASE_IP")
-DB_PORT     = os.getenv("DATABASE_PORT", "5432")
-DB_USER     = os.getenv("POSTGRES_USER")
-DB_NAME     = os.getenv("POSTGRES_DB_NAME")
-DB_PASSWORD = os.getenv("POSTGRES_PASSWORD")
-
 META_HOST     = os.getenv("METADATA_DB_HOST")
 META_PORT     = os.getenv("METADATA_DB_PORT", "5432")
 META_USER     = os.getenv("METADATA_DB_USER")
@@ -41,13 +35,19 @@ META_PASSWORD = os.getenv("METADATA_DB_PASSWORD")
 
 for key, val in [
     ("LLM_BASE_URL", LLM_BASE_URL), ("LLM_MODEL", LLM_MODEL),
-    ("DATABASE_IP", DB_HOST), ("POSTGRES_USER", DB_USER),
-    ("POSTGRES_DB_NAME", DB_NAME), ("POSTGRES_PASSWORD", DB_PASSWORD),
     ("METADATA_DB_HOST", META_HOST), ("METADATA_DB_USER", META_USER),
     ("METADATA_DB_NAME", META_DB_NAME), ("METADATA_DB_PASSWORD", META_PASSWORD),
 ]:
     if not val:
         raise ValueError(f"Missing required env var: {key}")
+
+_raw_creds = os.getenv("REGISTERED_DB_CREDENTIALS")
+if not _raw_creds:
+    raise ValueError("Missing required env var: REGISTERED_DB_CREDENTIALS")
+try:
+    REGISTERED_DB_CREDENTIALS: dict = json.loads(_raw_creds)
+except json.JSONDecodeError as e:
+    raise ValueError(f"REGISTERED_DB_CREDENTIALS is not valid JSON: {e}")
 
 llm_client = OpenAI(base_url=LLM_BASE_URL, api_key="EMPTY")
 
@@ -58,12 +58,17 @@ llm_client = OpenAI(base_url=LLM_BASE_URL, api_key="EMPTY")
 async def lifespan(app: FastAPI):
     logger.info("Starting up...")
 
-    # Target DB pool
-    app.state.db_pool = await asyncpg.create_pool(
-        host=DB_HOST, port=DB_PORT,
-        user=DB_USER, password=DB_PASSWORD, database=DB_NAME,
-    )
-    logger.info("Target DB pool ready (%s)", DB_NAME)
+    # One asyncpg pool per registered DB
+    app.state.db_pools = {}
+    for db_name, creds in REGISTERED_DB_CREDENTIALS.items():
+        app.state.db_pools[db_name] = await asyncpg.create_pool(
+            host=creds["host"],
+            port=creds.get("port", 5432),
+            user=creds["user"],
+            password=creds["password"],
+            database=db_name,
+        )
+        logger.info("Target DB pool ready (%s)", db_name)
 
     # Metadata DB pool
     app.state.meta_pool = await asyncpg.create_pool(
@@ -79,7 +84,8 @@ async def lifespan(app: FastAPI):
 
     yield
 
-    await app.state.db_pool.close()
+    for pool in app.state.db_pools.values():
+        await pool.close()
     await app.state.meta_pool.close()
     logger.info("Shutdown complete.")
 
@@ -90,8 +96,9 @@ app = FastAPI(lifespan=lifespan)
 # ── Request / response models ─────────────────────────────────────────────────
 
 class UserRequest(BaseModel):
+    db_name: str       # must match a db_name in registered_databases
     prompt: str
-    top_k: int = 5   # number of tables to retrieve via vector search
+    top_k: int = 5     # number of tables to retrieve via vector search
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
@@ -135,12 +142,19 @@ async def execute_query(pool, sql: str) -> list[dict]:
 async def generate_answer(user_request: UserRequest):
     t_start = time.time()
 
+    db_name = user_request.db_name
+    if db_name not in app.state.db_pools:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Unknown db_name '{db_name}'. Registered: {list(app.state.db_pools.keys())}",
+        )
+
     # 1. Retrieve relevant schema context
     try:
         ddl_context, table_names = await retrieve_context(
             meta_pool=app.state.meta_pool,
             embedder=app.state.embedder,
-            db_name=DB_NAME,
+            db_name=db_name,
             user_question=user_request.prompt,
             top_k=user_request.top_k,
         )
@@ -188,9 +202,11 @@ Output: SELECT reg_addr, linkedin FROM employee WHERE first_name = 'Mirzə' AND 
         raise HTTPException(status_code=400, detail=f"SQL validation failed: {e}")
 
     # 4. Execute — retry once on failure
+    logger.info("[EXEC] db_name=%s | sql=%s", db_name, sql)
+    db_pool = app.state.db_pools[db_name]
     retried = False
     try:
-        data = await execute_query(app.state.db_pool, sql)
+        data = await execute_query(db_pool, sql)
     except HTTPException as first_err:
         logger.warning("[RETRY] SQL execution failed: %s | sql=%s — retrying with error context",
                        first_err.detail, sql)
@@ -207,7 +223,7 @@ Output: SELECT reg_addr, linkedin FROM employee WHERE first_name = 'Mirzə' AND 
         except SQLValidationError as e:
             logger.error("SQL validation failed on retry: %s | sql=%s", e, sql)
             raise HTTPException(status_code=400, detail=f"SQL validation failed on retry: {e}")
-        data = await execute_query(app.state.db_pool, sql)
+        data = await execute_query(db_pool, sql)
         retried = True
         logger.info("[RETRY] Retry succeeded.")
 
