@@ -12,7 +12,7 @@ from dotenv import load_dotenv
 
 from description_embedder.embedder import Embedder
 from logger import get_logger
-from query_pipeline.retriever import retrieve_context
+from query_pipeline.retriever import retrieve_context, embed_question, check_relevance
 from query_pipeline.sql_validator import SQLValidationError, validate_sql
 
 logger = get_logger(__name__)
@@ -50,6 +50,10 @@ except json.JSONDecodeError as e:
     raise ValueError(f"REGISTERED_DB_CREDENTIALS is not valid JSON: {e}")
 
 llm_client = OpenAI(base_url=LLM_BASE_URL, api_key="EMPTY")
+
+# Minimum cosine similarity between the question and any table embedding.
+# Questions scoring below this are considered off-topic and rejected.
+MIN_RELEVANCE_SCORE = float(os.getenv("MIN_RELEVANCE_SCORE", "0.5"))
 
 
 # ── Lifespan ──────────────────────────────────────────────────────────────────
@@ -178,7 +182,21 @@ async def generate_answer(user_request: UserRequest):
         raise HTTPException(status_code=403, detail=f"Employee {emp_id} has no table access for database '{db_name}'")
     logger.info("emp_id=%d allowed_tables=%s", emp_id, sorted(allowed_tables))
 
-    # 3. Retrieve relevant schema context (filtered to allowed tables)
+    # 3. Embed question once — reused for relevance check and retrieval
+    query_vector = await embed_question(app.state.embedder, user_request.prompt)
+
+    # 4. Relevance check — reject off-topic questions before touching the LLM
+    top_similarity = await check_relevance(app.state.meta_pool, db_name, query_vector)
+    if top_similarity < MIN_RELEVANCE_SCORE:
+        logger.warning("Off-topic query rejected — emp_id=%d score=%.3f prompt=%r",
+                       emp_id, top_similarity, user_request.prompt)
+        raise HTTPException(
+            status_code=400,
+            detail="Query does not appear to be related to the database. Please ask a data retrieval question.",
+        )
+    logger.info("Relevance check passed — score=%.3f prompt=%r", top_similarity, user_request.prompt)
+
+    # 5. Retrieve relevant schema context (filtered to allowed tables)
     try:
         ddl_context, table_names = await retrieve_context(
             meta_pool=app.state.meta_pool,
@@ -187,6 +205,7 @@ async def generate_answer(user_request: UserRequest):
             user_question=user_request.prompt,
             top_k=user_request.top_k,
             allowed_tables=allowed_tables,
+            query_vector=query_vector,
         )
     except Exception as e:
         logger.error("Retrieval error: %s", e, exc_info=True)
@@ -198,7 +217,7 @@ async def generate_answer(user_request: UserRequest):
 
     logger.info("Retrieved tables (after access filter): %s", table_names)
 
-    # 4. Build system prompt and generate SQL
+    # 6. Build system prompt and generate SQL
     system_prompt = f"""You are an expert PostgreSQL query generator.
 Your job is to generate a SQL query that fetches exactly what the user asks for.
 
@@ -225,17 +244,17 @@ Output: SELECT reg_addr, linkedin FROM employee WHERE first_name = 'Mirzə' AND 
         {"role": "user",   "content": user_request.prompt},
     ]
 
-    # 5. Generate SQL
+    # 7. Generate SQL
     sql = call_llm(messages)
 
-    # 6. Validate SQL before touching the target DB
+    # 8. Validate SQL before touching the target DB
     try:
         validate_sql(sql, allowed_tables=table_names)
     except SQLValidationError as e:
         logger.warning("SQL validation failed: %s | sql=%s", e, sql)
         raise HTTPException(status_code=400, detail=f"SQL validation failed: {e}")
 
-    # 7. Execute — retry once on failure
+    # 9. Execute — retry once on failure
     logger.info("[EXEC] db_name=%s | sql=%s", db_name, sql)
     db_pool = app.state.db_pools[db_name]
     retried = False
