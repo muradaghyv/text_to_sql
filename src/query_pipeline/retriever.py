@@ -172,9 +172,13 @@ async def retrieve_context(
     db_name: str,
     user_question: str,
     top_k: int = 5,
+    allowed_tables: set[str] | None = None,
 ) -> tuple[str, list[str]]:
     """
     End-to-end retrieval: embed question → vector search → FK expand → build context.
+
+    If allowed_tables is provided, only tables in that set are included in the
+    returned context and table list (access control filter).
 
     Returns:
         ddl_context   — formatted string ready for the LLM system prompt
@@ -201,8 +205,12 @@ async def retrieve_context(
     if extra_names:
         extra_tables = await load_tables_by_name(meta_pool, db_name, extra_names)
 
-    # 6. Build context — top tables first (most relevant), extras after
+    # 6. Apply access filter if provided
     all_tables = top_tables + extra_tables
+    if allowed_tables is not None:
+        all_tables = [t for t in all_tables if t["table_name"] in allowed_tables]
+
+    # 7. Build context — top tables first (most relevant), extras after
     ddl_context = build_ddl_context(all_tables)
     all_names = [t["table_name"] for t in all_tables]
 
