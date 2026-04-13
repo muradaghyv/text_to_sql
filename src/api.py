@@ -7,12 +7,12 @@ from contextlib import asynccontextmanager
 import asyncpg
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
-from openai import OpenAI
+from openai import AsyncOpenAI
 from dotenv import load_dotenv
 
 from description_embedder.embedder import Embedder
 from logger import get_logger
-from query_pipeline.retriever import retrieve_context, embed_question, check_relevance
+from query_pipeline.retriever import retrieve_context, embed_question, vector_search
 from query_pipeline.sql_validator import SQLValidationError, validate_sql
 
 logger = get_logger(__name__)
@@ -49,7 +49,7 @@ try:
 except json.JSONDecodeError as e:
     raise ValueError(f"REGISTERED_DB_CREDENTIALS is not valid JSON: {e}")
 
-llm_client = OpenAI(base_url=LLM_BASE_URL, api_key="EMPTY")
+llm_client = AsyncOpenAI(base_url=LLM_BASE_URL, api_key="EMPTY")
 
 # Minimum cosine similarity between the question and any table embedding.
 # Questions scoring below this are considered off-topic and rejected.
@@ -121,10 +121,10 @@ def format_sql(text: str) -> str:
     return text
 
 
-def _call_llm(messages: list[dict], temperature: float = 0.1) -> str:
+async def _call_llm(messages: list[dict], temperature: float = 0.1) -> str:
     """Raw LLM call — returns content string as-is, raises HTTPException on error."""
     try:
-        response = llm_client.chat.completions.create(
+        response = await llm_client.chat.completions.create(
             model=LLM_MODEL,
             messages=messages,
             temperature=temperature,
@@ -138,14 +138,14 @@ def _call_llm(messages: list[dict], temperature: float = 0.1) -> str:
     return response.choices[0].message.content or ""
 
 
-def call_llm(messages: list[dict]) -> str:
-    return format_sql(_call_llm(messages))
+async def call_llm(messages: list[dict]) -> str:
+    return format_sql(await _call_llm(messages))
 
 
 AUGMENT_ROW_LIMIT = 50
 
 
-def augment_answer(question: str, sql: str, data: list[dict]) -> str | None:
+async def augment_answer(question: str, sql: str, data: list[dict]) -> str | None:
     """Ask the LLM to summarise query results in natural language. Returns None on failure."""
     rows = data[:AUGMENT_ROW_LIMIT]
     truncated = len(data) > AUGMENT_ROW_LIMIT
@@ -173,7 +173,7 @@ def augment_answer(question: str, sql: str, data: list[dict]) -> str | None:
         },
     ]
     try:
-        return _call_llm(messages, temperature=0.3)
+        return await _call_llm(messages, temperature=0.3)
     except Exception as e:
         logger.warning("Answer augmentation failed: %s", e)
         return None
@@ -224,11 +224,12 @@ async def generate_answer(user_request: UserRequest):
         raise HTTPException(status_code=403, detail=f"Employee {emp_id} has no table access for database '{db_name}'")
     logger.info("emp_id=%d allowed_tables=%s", emp_id, sorted(allowed_tables))
 
-    # 3. Embed question once — reused for relevance check and retrieval
+    # 2. Embed question once — reused for relevance check and retrieval
     query_vector = await embed_question(app.state.embedder, user_request.prompt)
 
-    # 4. Relevance check — reject off-topic questions before touching the LLM
-    top_similarity = await check_relevance(app.state.meta_pool, db_name, query_vector)
+    # 4. Vector search — one call serves both relevance check and retrieval
+    top_tables = await vector_search(app.state.meta_pool, db_name, query_vector, top_k=user_request.top_k)
+    top_similarity = top_tables[0]["similarity"] if top_tables else 0.0
     if top_similarity < MIN_RELEVANCE_SCORE:
         logger.warning("Off-topic query rejected — emp_id=%d score=%.3f prompt=%r",
                        emp_id, top_similarity, user_request.prompt)
@@ -238,7 +239,7 @@ async def generate_answer(user_request: UserRequest):
         )
     logger.info("Relevance check passed — score=%.3f prompt=%r", top_similarity, user_request.prompt)
 
-    # 5. Retrieve relevant schema context (filtered to allowed tables)
+    # 5. Retrieve relevant schema context (top_tables pre-fetched — skips second vector search)
     try:
         ddl_context, table_names = await retrieve_context(
             meta_pool=app.state.meta_pool,
@@ -248,6 +249,7 @@ async def generate_answer(user_request: UserRequest):
             top_k=user_request.top_k,
             allowed_tables=allowed_tables,
             query_vector=query_vector,
+            top_tables=top_tables,
         )
     except Exception as e:
         logger.error("Retrieval error: %s", e, exc_info=True)
@@ -287,7 +289,7 @@ Output: SELECT reg_addr, linkedin FROM employee WHERE first_name = 'Mirzə' AND 
     ]
 
     # 7. Generate SQL
-    sql = call_llm(messages)
+    sql = await call_llm(messages)
 
     # 8. Validate SQL before touching the target DB
     try:
@@ -312,7 +314,7 @@ Output: SELECT reg_addr, linkedin FROM employee WHERE first_name = 'Mirzə' AND 
                 "Fix the SQL and return only the corrected query."
             )},
         ]
-        sql = call_llm(retry_messages)
+        sql = await call_llm(retry_messages)
         try:
             validate_sql(sql, allowed_tables=table_names)
         except SQLValidationError as e:
@@ -323,7 +325,7 @@ Output: SELECT reg_addr, linkedin FROM employee WHERE first_name = 'Mirzə' AND 
         logger.info("[RETRY] Retry succeeded.")
 
     # 10. Augment: summarise raw results in natural language
-    answer = augment_answer(user_request.prompt, sql, data)
+    answer = await augment_answer(user_request.prompt, sql, data)
 
     logger.info("Request completed in %.2fs | retried=%s | sql=%s",
                 time.time() - t_start, retried, sql)
