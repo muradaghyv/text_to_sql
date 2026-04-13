@@ -29,7 +29,7 @@ class Embedder:
         embeddings = self._model.encode(
             texts,
             batch_size=batch_size,
-            show_progress_bar=True,
+            show_progress_bar=False,
             normalize_embeddings=True,   # cosine similarity ready
         )
         return embeddings.tolist()

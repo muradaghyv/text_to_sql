@@ -197,6 +197,7 @@ async def retrieve_context(
     top_k: int = 5,
     allowed_tables: set[str] | None = None,
     query_vector: list[float] | None = None,
+    top_tables: list[dict] | None = None,
 ) -> tuple[str, list[str]]:
     """
     End-to-end retrieval: embed question → vector search → FK expand → build context.
@@ -207,6 +208,9 @@ async def retrieve_context(
     If query_vector is provided, the embedding step is skipped (avoids re-embedding
     when the vector was already computed for a relevance check).
 
+    If top_tables is provided, the vector search step is skipped entirely (avoids
+    a duplicate DB round trip when the caller already fetched the top-K results).
+
     Returns:
         ddl_context   — formatted string ready for the LLM system prompt
         table_names   — list of all table names included in the context
@@ -215,28 +219,29 @@ async def retrieve_context(
     if query_vector is None:
         query_vector = await embed_question(embedder, user_question)
 
-    # 2. Vector search — top-K most similar tables
-    top_tables = await vector_search(meta_pool, db_name, query_vector, top_k=top_k)
+    # 2. Vector search — top-K most similar tables (skipped if pre-fetched)
+    if top_tables is None:
+        top_tables = await vector_search(meta_pool, db_name, query_vector, top_k=top_k)
     top_names = [t["table_name"] for t in top_tables]
 
-    # 3. FK expansion — add direct neighbors
-    neighbors = await expand_fk_neighbors(meta_pool, db_name, top_names)
+    # 3. FK expansion + two-hop bridge expansion — run in parallel (independent queries)
+    neighbors, bridges = await asyncio.gather(
+        expand_fk_neighbors(meta_pool, db_name, top_names),
+        expand_two_hop_bridges(meta_pool, db_name, top_names),
+    )
 
-    # 4. Two-hop bridge expansion — add bridge tables connecting retrieved tables
-    bridges = await expand_two_hop_bridges(meta_pool, db_name, top_names)
-
-    # 5. Load full metadata for all extra tables
+    # 4. Load full metadata for all extra tables
     extra_names = list((neighbors | bridges) - set(top_names))
     extra_tables = []
     if extra_names:
         extra_tables = await load_tables_by_name(meta_pool, db_name, extra_names)
 
-    # 6. Apply access filter if provided
+    # 5. Apply access filter if provided
     all_tables = top_tables + extra_tables
     if allowed_tables is not None:
         all_tables = [t for t in all_tables if t["table_name"] in allowed_tables]
 
-    # 7. Build context — top tables first (most relevant), extras after
+    # 6. Build context — top tables first (most relevant), extras after
     ddl_context = build_ddl_context(all_tables)
     all_names = [t["table_name"] for t in all_tables]
 
