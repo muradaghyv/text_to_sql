@@ -121,12 +121,13 @@ def format_sql(text: str) -> str:
     return text
 
 
-def call_llm(messages: list[dict]) -> str:
+def _call_llm(messages: list[dict], temperature: float = 0.1) -> str:
+    """Raw LLM call — returns content string as-is, raises HTTPException on error."""
     try:
         response = llm_client.chat.completions.create(
             model=LLM_MODEL,
             messages=messages,
-            temperature=0.1,
+            temperature=temperature,
             extra_body={"chat_template_kwargs": {"enable_thinking": False}},
         )
     except Exception as e:
@@ -134,7 +135,48 @@ def call_llm(messages: list[dict]) -> str:
         raise HTTPException(status_code=503, detail=f"LLM error: {e}")
     logger.debug("[TOKENS] prompt=%d  completion=%d",
                  response.usage.prompt_tokens, response.usage.completion_tokens)
-    return format_sql(response.choices[0].message.content or "")
+    return response.choices[0].message.content or ""
+
+
+def call_llm(messages: list[dict]) -> str:
+    return format_sql(_call_llm(messages))
+
+
+AUGMENT_ROW_LIMIT = 50
+
+
+def augment_answer(question: str, sql: str, data: list[dict]) -> str | None:
+    """Ask the LLM to summarise query results in natural language. Returns None on failure."""
+    rows = data[:AUGMENT_ROW_LIMIT]
+    truncated = len(data) > AUGMENT_ROW_LIMIT
+    data_text = json.dumps(rows, ensure_ascii=False, default=str)
+    if truncated:
+        data_text += f"\n\n(Showing first {AUGMENT_ROW_LIMIT} of {len(data)} rows)"
+
+    messages = [
+        {
+            "role": "system",
+            "content": (
+                "You are a helpful data assistant. "
+                "The user asked a question and the system ran a SQL query to answer it. "
+                "Your job is to summarise the query results in clear, natural language. "
+                "Be concise. Do not repeat the SQL. Do not add information not present in the data."
+            ),
+        },
+        {
+            "role": "user",
+            "content": (
+                f"Question: {question}\n\n"
+                f"SQL used:\n{sql}\n\n"
+                f"Results:\n{data_text}"
+            ),
+        },
+    ]
+    try:
+        return _call_llm(messages, temperature=0.3)
+    except Exception as e:
+        logger.warning("Answer augmentation failed: %s", e)
+        return None
 
 
 async def get_allowed_tables(meta_pool, emp_id: int, db_id: int) -> set[str]:
@@ -280,6 +322,9 @@ Output: SELECT reg_addr, linkedin FROM employee WHERE first_name = 'Mirzə' AND 
         retried = True
         logger.info("[RETRY] Retry succeeded.")
 
+    # 10. Augment: summarise raw results in natural language
+    answer = augment_answer(user_request.prompt, sql, data)
+
     logger.info("Request completed in %.2fs | retried=%s | sql=%s",
                 time.time() - t_start, retried, sql)
 
@@ -292,4 +337,5 @@ Output: SELECT reg_addr, linkedin FROM employee WHERE first_name = 'Mirzə' AND 
         "generated_sql":    sql,
         "retried":          retried,
         "data":             data,
+        "answer":           answer,
     }
