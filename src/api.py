@@ -24,6 +24,9 @@ ENV_PATH = os.path.join(PROJECT_ROOT, "env", ".env")
 
 load_dotenv(ENV_PATH)
 
+# Prevent tokenizers from spawning parallel workers — avoids semaphore leaks on shutdown
+os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
+
 LLM_BASE_URL = os.getenv("LLM_BASE_URL")
 LLM_MODEL    = os.getenv("LLM_MODEL")
 
@@ -94,9 +97,16 @@ async def lifespan(app: FastAPI):
 
     yield
 
-    for pool in app.state.db_pools.values():
-        await pool.close()
-    await app.state.meta_pool.close()
+    for db_name, pool in app.state.db_pools.items():
+        try:
+            await pool.close()
+        except Exception as e:
+            logger.warning("Error closing pool for %s: %s", db_name, e)
+    try:
+        await app.state.meta_pool.close()
+    except Exception as e:
+        logger.warning("Error closing metadata pool: %s", e)
+    await llm_client.aclose()
     logger.info("Shutdown complete.")
 
 
