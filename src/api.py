@@ -106,7 +106,7 @@ async def lifespan(app: FastAPI):
         await app.state.meta_pool.close()
     except Exception as e:
         logger.warning("Error closing metadata pool: %s", e)
-    await llm_client.aclose()
+    await llm_client.close()
     logger.info("Shutdown complete.")
 
 
