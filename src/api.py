@@ -5,8 +5,10 @@ import os
 from contextlib import asynccontextmanager
 
 import asyncpg
-from fastapi import FastAPI, HTTPException
+from fastapi import Depends, FastAPI, HTTPException
 from pydantic import BaseModel
+
+from auth import get_current_emp_id
 from openai import AsyncOpenAI
 from dotenv import load_dotenv
 
@@ -116,10 +118,9 @@ app = FastAPI(lifespan=lifespan)
 # ── Request / response models ─────────────────────────────────────────────────
 
 class UserRequest(BaseModel):
-    emp_id: int        # employee ID — used to enforce table-level access control
-    db_name: str       # must match a db_name in registered_databases
+    db_name: str   # must match a db_name in registered_databases
     prompt: str
-    top_k: int = 5     # number of tables to retrieve via vector search
+    top_k: int = 5
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
@@ -214,11 +215,13 @@ async def execute_query(pool, sql: str) -> list[dict]:
 # ── Endpoint ──────────────────────────────────────────────────────────────────
 
 @app.post("/generate")
-async def generate_answer(user_request: UserRequest):
+async def generate_answer(
+    user_request: UserRequest,
+    emp_id: int = Depends(get_current_emp_id),
+):
     t_start = time.time()
 
     db_name = user_request.db_name
-    emp_id  = user_request.emp_id
 
     if db_name not in app.state.db_pools:
         raise HTTPException(
