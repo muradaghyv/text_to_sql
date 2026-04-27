@@ -1,0 +1,11 @@
+.git
+env/.env
+logs/
+__pycache__/
+*.pyc
+*.ipynb
+tests/
+.vscode
+README.md
+LICENSE
+important_notes.md
