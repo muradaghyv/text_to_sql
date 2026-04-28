@@ -83,6 +83,13 @@ METADATA_DB_PASSWORD = "your-metadata-db-password"
 # LLM endpoint — used for description generation and SQL generation
 LLM_BASE_URL = "http://your-llm-host:8000/v1"
 LLM_MODEL    = "your-model-name"
+
+# Registered DB credentials — JSON map of db_name → connection details
+# Must match the db_name values stored in registered_databases
+REGISTERED_DB_CREDENTIALS={"YOUR_DB_NAME": {"host": "your-db-host", "port": 5432, "user": "your-db-user", "password": "your-db-password"}}
+
+# JWT secret — must match the key used to sign tokens sent by clients
+JWT_SECRET_KEY=your-secret-key
 ```
 
 ### 3. Set up the metadata database
@@ -109,9 +116,12 @@ psql -h <metadata-host> -U postgres -d nl2sql_metadata -f migrations/001_add_emb
 
 # Adds the two-hop FK path table
 psql -h <metadata-host> -U postgres -d nl2sql_metadata -f migrations/002_add_two_hop_paths.sql
+
+# Adds employee-level table access control (privilege_table_access, emp_table_access)
+psql -h <metadata-host> -U postgres -d nl2sql_metadata -f migrations/003_add_emp_table_access.sql
 ```
 
-Migrations `000` and `001` must run as superuser (`postgres`): `000` creates tables and grants privileges; `001` runs `CREATE EXTENSION` and `ALTER TABLE`. Migration `002` only creates tables and can run as either superuser or `nl2sql_user`.
+Migrations `000` and `001` must run as superuser (`postgres`): `000` creates tables and grants privileges; `001` runs `CREATE EXTENSION` and `ALTER TABLE`. Migrations `002` and `003` only create tables and can run as either superuser or `nl2sql_user`.
 
 > **Note:** `pgvector` must be installed on the metadata DB PostgreSQL server before running migration `001`. On Ubuntu: `apt install postgresql-16-pgvector` (adjust version to match yours).
 
@@ -207,21 +217,32 @@ The API loads the BGE-M3 model on startup and keeps it in memory.
 
 **POST** `/generate`
 
+**Headers:**
+```
+Authorization: Bearer <JWT_TOKEN>
+Content-Type: application/json
+```
+
+**Body:**
 ```json
 {
+  "db_name": "YOUR_DB_NAME",
   "prompt": "Show all orders placed by customers in Baku",
   "top_k": 5
 }
 ```
 
-`top_k` controls how many tables are retrieved by vector search before FK expansion. Default is 5.
+`db_name` must match a name registered in the metadata DB. `top_k` controls how many tables are retrieved by vector search before FK expansion — default is 5.
+
+The JWT token must be signed with `JWT_SECRET_KEY` (HS256) and contain an `emp_id` claim. The API uses `emp_id` to enforce table-level access control — only tables the employee has been granted access to are included in the LLM context.
 
 **Example with curl:**
 
 ```bash
 curl -X POST http://localhost:8080/generate \
   -H "Content-Type: application/json" \
-  -d '{"prompt": "Show all orders placed by customers in Baku"}'
+  -H "Authorization: Bearer <your-jwt-token>" \
+  -d '{"db_name": "YOUR_DB_NAME", "prompt": "Show all orders placed by customers in Baku"}'
 ```
 
 **Response:**
@@ -230,14 +251,86 @@ curl -X POST http://localhost:8080/generate \
 {
   "success": true,
   "processing_time": 1.43,
+  "emp_id": 42,
   "original_prompt": "Show all orders placed by customers in Baku",
   "retrieved_tables": ["orders", "customers"],
   "generated_sql": "SELECT o.* FROM orders o JOIN customers c ON c.id = o.customer_id WHERE c.city = 'Baku';",
-  "data": [...]
+  "retried": false,
+  "data": [...],
+  "answer": "There are 7 orders placed by customers in Baku."
 }
 ```
 
-`retrieved_tables` shows which tables were pulled into the LLM context — useful for debugging retrieval quality.
+`retrieved_tables` shows which tables were pulled into the LLM context — useful for debugging retrieval quality. `retried` is `true` if the first SQL attempt failed validation and the LLM made a second attempt. `answer` is a natural language summary of the results.
+
+---
+
+## Running with Docker
+
+The `docker-compose.yml` defines two services: the API and a `pgvector`-enabled metadata DB. This is the simplest way to run the stack — no local Postgres or conda setup needed for the API itself.
+
+### Prerequisites
+
+- Docker and Docker Compose
+- Your `env/.env` filled in (only the variables used at runtime are needed — see below)
+
+### Start
+
+```bash
+docker compose up --build
+```
+
+On first start, Docker will:
+1. Pull `pgvector/pgvector:pg16` and run all migrations automatically (from `migrations/`)
+2. Build the API image — installs CPU-only PyTorch then `requirements.txt`
+3. Download BGE-M3 on first request (~1.5 GB, cached in the `hf_cache` volume)
+
+The API is available at `http://localhost:8080` once both containers are healthy.
+
+### Runtime env vars (required in `env/.env`)
+
+```env
+LLM_BASE_URL=http://host.docker.internal:8000/v1   # vLLM running on your host machine
+LLM_MODEL=your-model-name
+
+METADATA_DB_HOST=metadata_db                        # matches the compose service name
+METADATA_DB_PASSWORD=your-metadata-db-password
+
+REGISTERED_DB_CREDENTIALS={"YOUR_DB_NAME": {"host": "...", "port": 5432, "user": "...", "password": "..."}}
+JWT_SECRET_KEY=your-secret-key
+```
+
+> `host.docker.internal` resolves to your host machine from inside the container (via `extra_hosts` in the compose file). Use this as the hostname in `LLM_BASE_URL` if your vLLM server runs locally.
+
+### Metadata DB port
+
+The metadata DB is exposed on host port **5433** to avoid clashing with a local Postgres on 5432. The API service connects to it on port 5432 internally — no configuration needed.
+
+### Volumes
+
+| Volume | Contents |
+|---|---|
+| `metadata_db_data` | Postgres data files — persists across restarts |
+| `hf_cache` | BGE-M3 model files — avoids re-downloading on restart |
+
+To fully reset (wipe all indexed metadata):
+
+```bash
+docker compose down -v
+```
+
+### Indexing inside Docker
+
+The indexing scripts (`run_setup.py`, `run_llm_descriptions.py`, `run_embedder.py`) are not included in the Docker image (excluded by `.dockerignore`). Run them locally with the conda env, pointing `METADATA_DB_HOST` at `localhost:5433`:
+
+```bash
+conda activate sql_llm
+# temporarily set METADATA_DB_HOST=localhost and METADATA_DB_PORT=5433 in env/.env
+python -m src.run_setup
+cd src
+python run_llm_descriptions.py http://your-llm-host:8000/v1
+python run_embedder.py
+```
 
 ---
 
