@@ -1,80 +1,64 @@
 services:
 
-  # ── Metadata database ────────────────────────────────────────────────────────
-  # pgvector/pgvector:pg16 is the official PostgreSQL 16 image with the pgvector
-  # extension pre-installed. We don't need to install it ourselves.
-  metadata_db:
-    image: pgvector/pgvector:pg16
-    restart: unless-stopped
-    environment:
-      # These three vars are read by the postgres image on first startup.
-      # They create the superuser, its password, and the default database.
-      POSTGRES_USER: nl2sql_user
-      POSTGRES_PASSWORD: ${METADATA_DB_PASSWORD}
-      POSTGRES_DB: nl2sql_metadata
-    volumes:
-      # Named volume: database files persist here across container restarts.
-      # If you delete this volume, all metadata is lost and must be re-indexed.
-      - metadata_db_data:/var/lib/postgresql/data
-
-      # Mount migrations/ into the init directory.
-      # PostgreSQL runs every .sql file here IN ALPHABETICAL ORDER on first startup
-      # (only when the data volume is empty / brand new).
-      # This automatically creates all tables and enables pgvector.
-      - ./migrations:/docker-entrypoint-initdb.d:ro
-    ports:
-      # Format: "host_port:container_port"
-      # We use 5433 on the host so it doesn't clash with a local postgres on 5432.
-      # The api service connects on 5432 (the internal port) — no conflict there.
-      - "5433:5432"
-    healthcheck:
-      # The api service won't start until this check passes.
-      # pg_isready returns 0 (healthy) only when postgres is accepting connections.
-      test: ["CMD-SHELL", "pg_isready -U nl2sql_user -d nl2sql_metadata"]
-      interval: 10s
-      timeout: 5s
-      retries: 5
-
   # ── API service ───────────────────────────────────────────────────────────────
+  # Connects to a metadata DB you provide via env vars (see env/.env).
+  #
+  # Two run modes, picked by the command argument:
+  #   docker compose up                  → runs the API (default CMD = "api")
+  #   docker compose run --rm api setup  → one-shot setup: applies migrations
+  #                                         to your metadata DB and runs the
+  #                                         four indexing scripts, then exits.
   api:
-    build: .        # Build an image from the Dockerfile in the current directory
-    restart: unless-stopped
+    build: .
+    # Restart only on real failures. The entrypoint exits 0 deliberately
+    # when registered_databases is empty (asking the admin to populate it),
+    # and `unless-stopped` would restart in a loop after that exit.
+    restart: on-failure
     ports:
       - "8080:8080"
     environment:
-      # LLM settings — your external vLLM / Ollama server
+      # ── LLM endpoint (your external vLLM / Ollama server) ────────────────────
       LLM_BASE_URL: ${LLM_BASE_URL}
       LLM_MODEL: ${LLM_MODEL}
 
-      # Metadata DB — reads host from .env (the real server IP)
+      # ── Metadata DB connection (application user) ────────────────────────────
       METADATA_DB_HOST: ${METADATA_DB_HOST}
       METADATA_DB_PORT: ${METADATA_DB_PORT:-5432}
-      METADATA_DB_USER: nl2sql_user
-      METADATA_DB_NAME: nl2sql_metadata
+      METADATA_DB_USER: ${METADATA_DB_USER:-nl2sql_user}
+      METADATA_DB_NAME: ${METADATA_DB_NAME:-nl2sql_metadata}
       METADATA_DB_PASSWORD: ${METADATA_DB_PASSWORD}
 
-      # Credentials for your target ERP database(s) — JSON format
-      REGISTERED_DB_CREDENTIALS: ${REGISTERED_DB_CREDENTIALS}
+      # ── Metadata DB superuser ────────────────────────────────────────────────
+      # Used on startup to create the metadata DB + nl2sql_user role if missing
+      # and to apply migrations (CREATE EXTENSION vector / pgcrypto).
+      METADATA_DB_ADMIN_USER: ${METADATA_DB_ADMIN_USER:-postgres}
+      METADATA_DB_ADMIN_PASSWORD: ${METADATA_DB_ADMIN_PASSWORD:-}
+
+      # ── Target-DB credential encryption ──────────────────────────────────────
+      # Symmetric key used to encrypt/decrypt the db_password_encrypted column
+      # on registered_databases. The same key must be used by whoever inserts
+      # rows (admin panel or manual psql).
+      DB_CRED_ENCRYPTION_KEY: ${DB_CRED_ENCRYPTION_KEY}
 
       # JWT secret for token validation
       JWT_SECRET_KEY: ${JWT_SECRET_KEY}
 
-      # Cosine similarity threshold (defaults to 0.5 if not set)
+      # Cosine similarity floor for off-topic rejection (default 0.5)
       MIN_RELEVANCE_SCORE: ${MIN_RELEVANCE_SCORE:-0.5}
+
+      # Privilege sync toggle. Set to "true" only if a target DB follows the
+      # ERPHUB convention (privileges/emp_roles/role_privileges tables).
+      RUN_PRIVILEGE_SYNC: ${RUN_PRIVILEGE_SYNC:-false}
     volumes:
       # Cache the BGE-M3 model files between container restarts.
-      # Without this, the ~1.5 GB model would be re-downloaded every time.
+      # Without this, the ~2 GB model would be re-downloaded every time.
       - hf_cache:/root/.cache/huggingface
     extra_hosts:
-      # Makes host.docker.internal resolve to your PC from inside the container.
-      # Use this as the hostname for vLLM in LLM_BASE_URL (e.g. http://host.docker.internal:8000/v1)
+      # Lets the container reach services bound to your host's loopback
+      # (e.g. a vLLM server running on your laptop). Use host.docker.internal
+      # as the hostname in LLM_BASE_URL.
       - "host.docker.internal:host-gateway"
-    depends_on:
-      metadata_db:
-        condition: service_healthy   # Wait for postgres to be ready before starting
 
 # ── Named volumes ─────────────────────────────────────────────────────────────
-# Docker manages these on the host. They persist until you explicitly delete them.
 volumes:
-  metadata_db_data:   # postgres data files
-  hf_cache:           # Hugging Face model cache (BGE-M3)
+  hf_cache:   # Hugging Face model cache (BGE-M3) — persists across restarts

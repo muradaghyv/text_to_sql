@@ -4,10 +4,11 @@
 FROM python:3.12-slim
 
 # ── System dependencies ───────────────────────────────────────────────────────
-# gcc is required to compile some Python packages that include C extensions
-# (asyncpg in particular). --no-install-recommends keeps the layer lean.
-# We delete the apt cache immediately so it doesn't bloat the image.
-RUN apt-get update && apt-get install -y --no-install-recommends gcc \
+# gcc            — needed to compile Python packages with C extensions (asyncpg).
+# postgresql-client — provides the `psql` binary, used by setup mode in
+#                  docker-entrypoint.sh to apply migrations against the metadata DB.
+# --no-install-recommends keeps the layer lean. The apt cache is purged immediately.
+RUN apt-get update && apt-get install -y --no-install-recommends gcc postgresql-client \
     && rm -rf /var/lib/apt/lists/*
 
 # ── Working directory ─────────────────────────────────────────────────────────
@@ -28,19 +29,23 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
 # ── Application code ──────────────────────────────────────────────────────────
-# We copy only the source code. env/ is excluded by .dockerignore — secrets
-# are injected via environment variables at runtime, not baked into the image.
+# Source code, migrations, and the entrypoint script. env/ is excluded by
+# .dockerignore — secrets are injected via environment variables at runtime,
+# not baked into the image.
 COPY src/ ./src/
+COPY migrations/ ./migrations/
+COPY docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
+RUN chmod +x /usr/local/bin/docker-entrypoint.sh
 
 # ── Port ─────────────────────────────────────────────────────────────────────
 # Documents which port the app listens on. This does NOT publish the port
 # to the host — that's done in docker-compose.yml.
 EXPOSE 8080
 
-# ── Startup command ───────────────────────────────────────────────────────────
-# api.py uses bare imports ("from auth import ...") that work only when the
-# working directory IS src/. We set WORKDIR here so uvicorn runs from the
-# right place.
-WORKDIR /app/src
-
-CMD ["uvicorn", "api:app", "--host", "0.0.0.0", "--port", "8080"]
+# ── Entrypoint ────────────────────────────────────────────────────────────────
+# The entrypoint script switches behaviour on the first argument:
+#   setup  — apply migrations + run all indexing scripts (one-shot)
+#   api    — run uvicorn (default; long-running)
+# Override at run time, e.g. `docker compose run --rm api setup`.
+ENTRYPOINT ["/usr/local/bin/docker-entrypoint.sh"]
+CMD ["api"]
