@@ -1,47 +1,329 @@
 # text-to-SQL
 
-A RAG-based text-to-SQL system for PostgreSQL. You connect it to your database, it reads the schema once, embeds it, and then lets users ask questions in plain language — the system finds the relevant tables, builds a DDL context, and asks an LLM to write the query.
+A RAG-based text-to-SQL system for PostgreSQL. You connect it to one or more databases, it reads each schema once and embeds it, and then lets users ask questions in plain language. The system finds the relevant tables, builds a DDL context, asks an LLM to write the query, validates the SQL with `sqlglot`, and executes it. Per-employee table access is enforced via JWT.
+
+The system is deliberately database-agnostic. The only thing tying it to a specific schema is what an admin inserts into the `registered_databases` table.
+
+---
 
 ## How it works
 
 ```
-Your PostgreSQL DB
-        │
-        ▼
-[Step 1] Schema extraction    — tables, columns, DDL, FK relationships, and two-hop
-                                 FK paths are stored in a separate metadata DB
-        │
-        ▼
-[Step 2] LLM description      — an LLM writes a one-sentence description for each
-                                 table and a short description for each column
-        │
-        ▼
-[Step 3] Embedding            — each table's description + column descriptions are
-                                 concatenated into a text blob and embedded with
-                                 BAAI/bge-m3 (1024-dim dense vectors, via pgvector)
-        │
-        ▼
-[Step 4] Query API            — user sends a question → question is embedded →
-                                 cosine similarity finds the top-K tables →
-                                 DDL context is built → LLM writes SQL →
-                                 SQL is executed → results returned
+                      ┌────────────────────────────┐
+Admin (admin panel    │  registered_databases      │
+or psql) inserts a ──▶│  one row per target DB:    │
+target DB row         │  host, port, user, pwd*    │
+                      └─────────────┬──────────────┘
+                                    │
+                          docker compose up
+                                    ▼
+                ┌──────────────────────────────────────┐
+                │  Container startup pipeline           │
+                │                                       │
+                │  1. ensure metadata DB + role exist  │
+                │  2. apply migrations (idempotent)     │
+                │  3. for every unindexed registered_   │
+                │     databases row:                    │
+                │       a. extract DDL, FKs, two-hop    │
+                │          paths from target DB         │
+                │       b. pull pg_description comments │
+                │       c. embed with BGE-M3            │
+                │       d. write to metadata DB         │
+                │     (failures recorded, others        │
+                │      continue)                        │
+                │  4. start uvicorn                     │
+                └──────────────────────────────────────┘
+                                    │
+                  POST /generate    ▼
+                ┌──────────────────────────────────────┐
+                │  question → embed → vector search →   │
+                │  FK + two-hop expansion → DDL context │
+                │  → LLM writes SQL → sqlglot validates │
+                │  → execute against target DB → return │
+                └──────────────────────────────────────┘
+
+* Passwords are stored encrypted with pgcrypto symmetric encryption.
+  The encryption key is read from the DB_CRED_ENCRYPTION_KEY env var.
 ```
 
 ---
 
 ## Prerequisites
 
-- Python 3.11+ (Conda recommended — this project uses the `sql_llm` env)
-- **Target DB** — the PostgreSQL database you want to query in natural language. The credentials you provide need at least `SELECT` access on all tables in the `public` schema.
-- **Metadata DB** — a separate PostgreSQL instance where this tool stores table descriptions, embeddings, and FK graphs. You set this up once (see below). Requires the `pgvector` extension.
-- An OpenAI-compatible LLM endpoint (e.g. vLLM, Ollama) for description generation and SQL generation
-- ~2 GB disk for the BGE-M3 embedding model (downloaded automatically on first run)
+- Docker and Docker Compose
+- A PostgreSQL server reachable from the container — this hosts the metadata DB. It must have `pgvector` and `pgcrypto` extensions installed (Ubuntu: `apt install postgresql-16-pgvector` plus pgcrypto, which ships with PostgreSQL).
+- One or more target PostgreSQL databases the system will be allowed to query.
+- An OpenAI-compatible LLM endpoint (e.g. vLLM, Ollama).
+- ~2 GB disk for the BGE-M3 embedding model (downloaded automatically on first start).
 
 ---
 
-## Setup
+## First-time setup (one-time)
 
-### 1. Create and activate the conda environment
+### 1. Configure `env/.env`
+
+Copy the template and fill in the four blocks:
+
+```bash
+cp env/.env.temp env/.env
+```
+
+```env
+# LLM endpoint
+LLM_BASE_URL=http://host.docker.internal:8000/v1
+LLM_MODEL=cyankiwi/Qwen3-30B-A3B-Instruct-2507-AWQ-4bit
+
+# Metadata DB — application user (auto-created on first run if missing)
+METADATA_DB_HOST=your-metadata-db-host
+METADATA_DB_PORT=5432
+METADATA_DB_USER=nl2sql_user
+METADATA_DB_NAME=nl2sql_metadata
+METADATA_DB_PASSWORD=a-strong-password
+
+# Metadata DB superuser — used on startup to create the DB + role and apply
+# migrations (CREATE EXTENSION vector / pgcrypto require superuser).
+METADATA_DB_ADMIN_USER=postgres
+METADATA_DB_ADMIN_PASSWORD=your-postgres-superuser-password
+
+# Symmetric key used to encrypt/decrypt target-DB passwords stored in
+# registered_databases. Must be the same value used when inserting rows.
+# Pick a long random value and keep it secret.
+DB_CRED_ENCRYPTION_KEY=a-long-random-string
+
+# JWT — must match the key used by the auth system that signs tokens
+JWT_SECRET_KEY=your-jwt-secret
+
+# Off-topic rejection floor (cosine similarity, default 0.5)
+MIN_RELEVANCE_SCORE=0.5
+```
+
+> `host.docker.internal` resolves to your host machine from inside the container; use it for any service running on your laptop (e.g. vLLM).
+
+### 2. First docker run — creates the metadata DB
+
+```bash
+docker compose --env-file env/.env up
+```
+
+The container will:
+- create `nl2sql_user` if missing,
+- create the `nl2sql_metadata` database if missing,
+- apply every migration in `migrations/`,
+- detect that `registered_databases` is empty and **exit with a message** telling you to populate it.
+
+You should see something like:
+
+```
+────────────────────────────────────────────────────────────────────────
+Metadata DB 'nl2sql_metadata' is ready, but no target DBs are registered.
+Insert one row per target DB into the registered_databases table and
+re-run `docker compose up`.
+────────────────────────────────────────────────────────────────────────
+```
+
+### 3. Register a target DB
+
+Connect to the metadata DB and insert one row per target database. The password is encrypted with `pgp_sym_encrypt` using your `DB_CRED_ENCRYPTION_KEY`:
+
+```sql
+INSERT INTO registered_databases
+    (db_name, host, port, schema_name, db_user, db_password_encrypted)
+VALUES (
+    'ERPHUB',
+    'your-target-db-host',
+    5432,
+    'public',
+    'erphub_reader',
+    pgp_sym_encrypt('your-target-db-password', 'a-long-random-string')
+);
+```
+
+> The same `DB_CRED_ENCRYPTION_KEY` value goes in both places — `env/.env` and the `pgp_sym_encrypt` call. If they don't match, the API will fail to decrypt at startup.
+
+### 4. Second docker run — indexes the target DB and starts the API
+
+```bash
+docker compose --env-file env/.env up -d
+```
+
+This time the container detects the new `registered_databases` row, indexes it (DDL → FKs → two-hop paths → embeddings), then starts uvicorn on port 8080. Watch progress with:
+
+```bash
+docker compose logs -f api
+```
+
+You're ready when you see `INFO: Application startup complete.`
+
+---
+
+## Adding a second target database
+
+Insert another row into `registered_databases` (with a different `db_name`), then restart:
+
+```sql
+INSERT INTO registered_databases
+    (db_name, host, port, schema_name, db_user, db_password_encrypted)
+VALUES (
+    'ABC',
+    'abc-db-host',
+    5432,
+    'public',
+    'abc_reader',
+    pgp_sym_encrypt('abc-password', 'a-long-random-string')
+);
+```
+
+```bash
+docker compose --env-file env/.env down
+docker compose --env-file env/.env up -d
+```
+
+The container scans `registered_databases`, finds that ABC has no rows in `table_metadata`, and indexes only ABC. Existing DBs (e.g. ERPHUB) are untouched. After startup, both DBs serve `/generate`:
+
+```json
+{ "db_name": "ERPHUB", "prompt": "..." }
+{ "db_name": "ABC",    "prompt": "..." }
+```
+
+If indexing of one row fails (e.g. unreachable host), the error is written to its `indexing_error` column and the API starts anyway with whatever indexed successfully. Fix the row and restart to retry; the indexer will pick it up because of the non-null `indexing_error`.
+
+---
+
+## Optional — LLM-generated descriptions
+
+By default the indexer only pulls table/column comments that are already on the target DB (`COMMENT ON TABLE`, `COMMENT ON COLUMN`). If your target DB has no comments, retrieval still works (a structural fallback like "Stores employee records" is used) but quality is worse.
+
+To enrich descriptions with an LLM, run the `describe` mode after the API is up:
+
+```bash
+docker compose --env-file env/.env run --rm api describe              # all DBs, az, fill-empty
+docker compose --env-file env/.env run --rm api describe --force      # overwrite everything
+docker compose --env-file env/.env run --rm api describe --db ERPHUB --lang en
+```
+
+Defaults: `--lang az` (Azerbaijani output) and **fill-empty** — only tables/columns whose description is currently empty get an LLM call. Use `--force` to overwrite everything. After updates the affected tables are re-embedded automatically.
+
+---
+
+## API usage
+
+**POST** `/generate`
+
+```bash
+curl -X POST http://localhost:8080/generate \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer <JWT>" \
+  -d '{"db_name": "ERPHUB", "prompt": "Show all orders placed by customers in Baku"}'
+```
+
+JWT must be HS256-signed with `JWT_SECRET_KEY` and contain an `emp_id` claim. The API uses `emp_id` to enforce per-employee table access — only tables the employee has been granted access to are included in the LLM context. Grants live in `emp_table_access`. If `emp_table_access` has no rows for an `emp_id`, the API returns 403.
+
+Response shape:
+
+```json
+{
+  "success": true,
+  "processing_time": 1.43,
+  "emp_id": 42,
+  "original_prompt": "...",
+  "retrieved_tables": ["orders", "customers"],
+  "generated_sql": "SELECT ...",
+  "retried": false,
+  "data": [...],
+  "answer": "..."
+}
+```
+
+`retried` is true if the first SQL attempt failed at execution and the LLM was given the error for one self-correction attempt.
+
+### Safety features
+
+1. **Off-topic rejection.** If the question's top cosine similarity to any table embedding is below `MIN_RELEVANCE_SCORE` (default 0.5), the API returns 422 — the LLM is never called.
+2. **SQL validation (sqlglot, 7 rules).** The generated SQL must parse cleanly, be a single `SELECT`, reference only employee-allowed tables, and pass other checks (no DDL/DML, no system tables, etc.).
+3. **Self-correction retry.** If a validated query fails at execution time, the error is fed back to the LLM for one retry.
+
+---
+
+## Testing without a second target DB
+
+For testing the multi-DB flow, the simplest option is to clone an existing target DB on the same Postgres server. As superuser, with no active connections to the source DB:
+
+```sql
+CREATE DATABASE "ERPHUB_NEW" WITH TEMPLATE "ERPHUB" OWNER <owner>;
+```
+
+Then insert a second row in `registered_databases` pointing at `ERPHUB_NEW` and restart docker. Indexing is independent for each DB so this gives you a real two-DB setup without provisioning new data.
+
+---
+
+## Common operations
+
+**Change `env/.env` and reload:**
+
+```bash
+docker compose --env-file env/.env down
+# edit env/.env
+docker compose --env-file env/.env up -d
+```
+
+`down` removes the container; `up` recreates with the new env. Plain `restart` does **not** pick up new env values.
+
+**Rebuild after changing source code, `Dockerfile`, or `requirements.txt`:**
+
+```bash
+docker compose --env-file env/.env up -d --build
+```
+
+**Re-index a target DB** (schema changed) — clear its child rows so the orchestrator treats it as unindexed:
+
+```sql
+DELETE FROM table_metadata     WHERE db_id = (SELECT id FROM registered_databases WHERE db_name='ERPHUB');
+DELETE FROM table_relationships WHERE db_id = (SELECT id FROM registered_databases WHERE db_name='ERPHUB');
+DELETE FROM two_hop_paths      WHERE db_id = (SELECT id FROM registered_databases WHERE db_name='ERPHUB');
+```
+
+```bash
+docker compose --env-file env/.env down
+docker compose --env-file env/.env up -d
+```
+
+**Stop:**
+
+```bash
+docker compose --env-file env/.env down
+```
+
+**Wipe the BGE-M3 cache** (forces a re-download next time):
+
+```bash
+docker compose --env-file env/.env down -v
+```
+
+This does **not** touch your metadata DB.
+
+---
+
+## Per-employee table access
+
+The API enforces table-level access control: a JWT with `emp_id=42` can only query tables that employee 42 has been granted access to. Grants are rows in `emp_table_access`:
+
+```sql
+INSERT INTO emp_table_access (emp_id, db_id, table_name) VALUES
+  (42, 1, 'orders'),
+  (42, 1, 'customers');
+```
+
+For ERPHUB-style target DBs (with `privileges`, `emp_roles`, `role_privileges` tables) there is also a fuzzy auto-sync script:
+
+```bash
+docker compose --env-file env/.env run --rm api python run_privilege_sync.py --apply
+```
+
+> **Note:** `run_privilege_sync.py` is currently still hard-coded to the legacy `POSTGRES_*` env vars. If you need it for a non-ERPHUB target DB, populate `emp_table_access` manually with INSERTs as shown above.
+
+---
+
+## Local development (without Docker)
 
 ```bash
 conda create -n sql_llm python=3.12 -y
@@ -49,314 +331,15 @@ conda activate sql_llm
 pip install -r requirements.txt
 ```
 
-If you already have the `sql_llm` environment, just activate it:
+The legacy CLI scripts in `src/` still work for ad-hoc development against a single target DB, using `POSTGRES_*` env vars:
 
 ```bash
-conda activate sql_llm
+python src/run_setup.py                                          # extract schema
+python src/run_embedder.py                                       # embed
+python src/run_llm_descriptions.py --db ERPHUB --lang az         # optional descriptions
 ```
 
-### 2. Configure environment
-
-Copy the template and fill in your values:
-
-```bash
-cp env/.env.temp env/.env
-```
-
-Edit `env/.env`:
-
-```env
-# Target database — the one you want to query
-DATABASE_IP       = "your-db-host"
-DATABASE_PORT     = "5432"
-POSTGRES_USER     = "your-db-user"
-POSTGRES_DB_NAME  = "your-db-name"
-POSTGRES_PASSWORD = "your-db-password"
-
-# Metadata database — stores descriptions and embeddings (you provision this once)
-METADATA_DB_HOST     = "your-metadata-db-host"
-METADATA_DB_PORT     = "5432"
-METADATA_DB_USER     = "nl2sql_user"
-METADATA_DB_NAME     = "nl2sql_metadata"
-METADATA_DB_PASSWORD = "your-metadata-db-password"
-
-# LLM endpoint — used for description generation and SQL generation
-LLM_BASE_URL = "http://your-llm-host:8000/v1"
-LLM_MODEL    = "your-model-name"
-
-# Registered DB credentials — JSON map of db_name → connection details
-# Must match the db_name values stored in registered_databases
-REGISTERED_DB_CREDENTIALS={"YOUR_DB_NAME": {"host": "your-db-host", "port": 5432, "user": "your-db-user", "password": "your-db-password"}}
-
-# JWT secret — must match the key used to sign tokens sent by clients
-JWT_SECRET_KEY=your-secret-key
-```
-
-### 3. Set up the metadata database
-
-This is a one-time step. You need a PostgreSQL server where the tool will store schema metadata and embeddings.
-
-Connect to that server as a superuser and create the user and database:
-
-```sql
-CREATE USER nl2sql_user WITH PASSWORD 'your-metadata-db-password';
-CREATE DATABASE nl2sql_metadata OWNER nl2sql_user;
-```
-
-> If `nl2sql_user` already exists (e.g. you are re-setting up), skip the `CREATE USER` line.
-
-Then apply the migrations in order from the **project root**:
-
-```bash
-# Creates tables (table_metadata, table_relationships, registered_databases)
-psql -h <metadata-host> -U postgres -d nl2sql_metadata -f migrations/000_create_metadata_db.sql
-
-# Adds the pgvector embedding column and cosine similarity index
-psql -h <metadata-host> -U postgres -d nl2sql_metadata -f migrations/001_add_embedding_column.sql
-
-# Adds the two-hop FK path table
-psql -h <metadata-host> -U postgres -d nl2sql_metadata -f migrations/002_add_two_hop_paths.sql
-
-# Adds employee-level table access control (privilege_table_access, emp_table_access)
-psql -h <metadata-host> -U postgres -d nl2sql_metadata -f migrations/003_add_emp_table_access.sql
-```
-
-Migrations `000` and `001` must run as superuser (`postgres`): `000` creates tables and grants privileges; `001` runs `CREATE EXTENSION` and `ALTER TABLE`. Migrations `002` and `003` only create tables and can run as either superuser or `nl2sql_user`.
-
-> **Note:** `pgvector` must be installed on the metadata DB PostgreSQL server before running migration `001`. On Ubuntu: `apt install postgresql-16-pgvector` (adjust version to match yours).
-
-> **Note:** Migration `000` includes grant statements targeting a database named `postgres`. These are irrelevant to your actual target DB and can be ignored — the tool connects to your target DB using the credentials you provide in `.env`, not as `nl2sql_user`. Just ensure that `POSTGRES_USER` in `.env` has `SELECT` access on all tables in your target DB's `public` schema.
-
----
-
-## Indexing your database
-
-Run these three steps once for each database you want to make queryable. Re-run them whenever the schema changes.
-
-### Step 1 — Extract schema
-
-Connects to your target database and stores table DDL, column metadata, FK relationships, and two-hop FK paths into the metadata DB.
-
-Run from the **project root** (the directory containing `src/`):
-
-```bash
-conda activate sql_llm
-python -m src.run_setup
-# or with a custom env file:
-python -m src.run_setup env/.env.staging
-```
-
-What it stores per table:
-- Column names, types, nullable flags, primary keys
-- Foreign key relationships (source table/column → target table/column)
-- Two-hop paths: tables connected through a shared bridge table (e.g. `orders ──[order_items]── products`)
-
-### Step 2 — Generate descriptions with an LLM
-
-For each table, calls your LLM endpoint to produce:
-- A one-sentence description of what the table stores
-- A short description for each column (with FK context, e.g. "references customers.id")
-
-These descriptions are what gets embedded, so the better they are, the more accurate the retrieval.
-
-Before running, verify your LLM endpoint is reachable:
-
-```bash
-curl http://your-llm-host:8000/v1/models
-```
-
-Then generate descriptions:
-
-```bash
-cd src
-python run_llm_descriptions.py http://your-llm-host:8000/v1
-# or with explicit model and DB name:
-python run_llm_descriptions.py http://your-llm-host:8000/v1 your-model-name YOUR_DB_NAME
-```
-
-`YOUR_DB_NAME` defaults to `POSTGRES_DB_NAME` from `.env` if not passed.
-
-### Step 3 — Embed descriptions
-
-Builds a structured text blob per table (table description + column descriptions + related tables), embeds it with `BAAI/bge-m3`, and writes the 1024-dim vector back to the metadata DB. The BGE-M3 model is downloaded automatically on first run (~2 GB).
-
-```bash
-cd src
-python run_embedder.py
-# or with explicit env and DB name:
-python run_embedder.py ../env/.env YOUR_DB_NAME
-```
-
-The embedding text blob for a table looks like:
-
-```
-Table: orders
-Description: Stores customer purchase orders.
-Columns:
-  - id (integer, PK): unique order identifier
-  - customer_id (integer): references customers.id
-  - total (numeric): total order amount
-Related tables: customers, order_items
-```
-
-This is the text the model embeds — and what your question's embedding is compared against at query time.
-
----
-
-## Running the API
-
-```bash
-conda activate sql_llm
-cd src
-uvicorn api:app --host 0.0.0.0 --port 8080
-```
-
-The API loads the BGE-M3 model on startup and keeps it in memory.
-
-### Query endpoint
-
-**POST** `/generate`
-
-**Headers:**
-```
-Authorization: Bearer <JWT_TOKEN>
-Content-Type: application/json
-```
-
-**Body:**
-```json
-{
-  "db_name": "YOUR_DB_NAME",
-  "prompt": "Show all orders placed by customers in Baku",
-  "top_k": 5
-}
-```
-
-`db_name` must match a name registered in the metadata DB. `top_k` controls how many tables are retrieved by vector search before FK expansion — default is 5.
-
-The JWT token must be signed with `JWT_SECRET_KEY` (HS256) and contain an `emp_id` claim. The API uses `emp_id` to enforce table-level access control — only tables the employee has been granted access to are included in the LLM context.
-
-**Example with curl:**
-
-```bash
-curl -X POST http://localhost:8080/generate \
-  -H "Content-Type: application/json" \
-  -H "Authorization: Bearer <your-jwt-token>" \
-  -d '{"db_name": "YOUR_DB_NAME", "prompt": "Show all orders placed by customers in Baku"}'
-```
-
-**Response:**
-
-```json
-{
-  "success": true,
-  "processing_time": 1.43,
-  "emp_id": 42,
-  "original_prompt": "Show all orders placed by customers in Baku",
-  "retrieved_tables": ["orders", "customers"],
-  "generated_sql": "SELECT o.* FROM orders o JOIN customers c ON c.id = o.customer_id WHERE c.city = 'Baku';",
-  "retried": false,
-  "data": [...],
-  "answer": "There are 7 orders placed by customers in Baku."
-}
-```
-
-`retrieved_tables` shows which tables were pulled into the LLM context — useful for debugging retrieval quality. `retried` is `true` if the first SQL attempt failed validation and the LLM made a second attempt. `answer` is a natural language summary of the results.
-
----
-
-## Running with Docker
-
-The `docker-compose.yml` defines two services: the API and a `pgvector`-enabled metadata DB. This is the simplest way to run the stack — no local Postgres or conda setup needed for the API itself.
-
-### Prerequisites
-
-- Docker and Docker Compose
-- Your `env/.env` filled in (only the variables used at runtime are needed — see below)
-
-### Start
-
-```bash
-docker compose up --build
-```
-
-On first start, Docker will:
-1. Pull `pgvector/pgvector:pg16` and run all migrations automatically (from `migrations/`)
-2. Build the API image — installs CPU-only PyTorch then `requirements.txt`
-3. Download BGE-M3 on first request (~1.5 GB, cached in the `hf_cache` volume)
-
-The API is available at `http://localhost:8080` once both containers are healthy.
-
-### Runtime env vars (required in `env/.env`)
-
-```env
-LLM_BASE_URL=http://host.docker.internal:8000/v1   # vLLM running on your host machine
-LLM_MODEL=your-model-name
-
-METADATA_DB_HOST=metadata_db                        # matches the compose service name
-METADATA_DB_PASSWORD=your-metadata-db-password
-
-REGISTERED_DB_CREDENTIALS={"YOUR_DB_NAME": {"host": "...", "port": 5432, "user": "...", "password": "..."}}
-JWT_SECRET_KEY=your-secret-key
-```
-
-> `host.docker.internal` resolves to your host machine from inside the container (via `extra_hosts` in the compose file). Use this as the hostname in `LLM_BASE_URL` if your vLLM server runs locally.
-
-### Metadata DB port
-
-The metadata DB is exposed on host port **5433** to avoid clashing with a local Postgres on 5432. The API service connects to it on port 5432 internally — no configuration needed.
-
-### Volumes
-
-| Volume | Contents |
-|---|---|
-| `metadata_db_data` | Postgres data files — persists across restarts |
-| `hf_cache` | BGE-M3 model files — avoids re-downloading on restart |
-
-To fully reset (wipe all indexed metadata):
-
-```bash
-docker compose down -v
-```
-
-### Indexing inside Docker
-
-The indexing scripts (`run_setup.py`, `run_llm_descriptions.py`, `run_embedder.py`) are not included in the Docker image (excluded by `.dockerignore`). Run them locally with the conda env, pointing `METADATA_DB_HOST` at `localhost:5433`:
-
-```bash
-conda activate sql_llm
-# temporarily set METADATA_DB_HOST=localhost and METADATA_DB_PORT=5433 in env/.env
-python -m src.run_setup
-cd src
-python run_llm_descriptions.py http://your-llm-host:8000/v1
-python run_embedder.py
-```
-
----
-
-## Retrieval pipeline (what happens per request)
-
-1. The user's question is embedded with BGE-M3 (same model used at index time)
-2. Cosine similarity search against `table_metadata.embedding` returns the top-K most relevant tables
-3. FK expansion: directly FK-connected tables are added to the context
-4. Two-hop bridge expansion: tables connected through a shared FK bridge are added
-5. DDL context is built: `CREATE TABLE` statements with column descriptions for every retrieved table
-6. The DDL context + user question is sent to the LLM, which writes a SQL query
-7. The query is executed against the target DB and results are returned
-
----
-
-## Re-indexing
-
-If you add tables, change column names, or want to refresh descriptions, re-run all three steps. Start from the **project root**:
-
-```bash
-conda activate sql_llm
-python -m src.run_setup          # must be run from project root
-cd src
-python run_llm_descriptions.py http://your-llm-host:8000/v1
-python run_embedder.py
-```
+These bypass the multi-DB orchestrator and are mostly useful when iterating on a single DB.
 
 ---
 
@@ -366,3 +349,43 @@ python run_embedder.py
 conda activate sql_llm
 python -m pytest tests/ -v
 ```
+
+61 unit tests; no DB connection required.
+
+---
+
+## Repo layout
+
+```
+ai_erp_report/
+├── src/
+│   ├── api.py                        # FastAPI app, POST /generate
+│   ├── auth.py                       # JWT validation
+│   ├── logger.py
+│   ├── metadata_store.py             # all CRUD on nl2sql_metadata
+│   ├── run_index_unindexed.py        # startup orchestrator
+│   ├── run_setup.py                  # per-DB schema extraction
+│   ├── run_embedder.py               # per-DB BGE-M3 embedding
+│   ├── run_llm_descriptions.py       # describe mode (optional)
+│   ├── run_privilege_sync.py         # legacy ERPHUB privilege sync
+│   ├── schema_extractor/             # DDL, FK, two-hop path extraction
+│   ├── description_embedder/         # text-blob builder + embedder
+│   └── query_pipeline/               # retriever, sql_validator
+├── migrations/                       # 000–004, all idempotent
+├── env/.env.temp                     # template
+├── docker-entrypoint.sh
+├── docker-compose.yml
+├── Dockerfile
+└── tests/                            # pytest, mocks only
+```
+
+---
+
+## Stack
+
+- Python 3.12, FastAPI, asyncpg (runtime) + psycopg2 (indexing)
+- PostgreSQL with `pgvector` and `pgcrypto` extensions
+- BAAI/bge-m3 1024-dim embeddings via sentence-transformers (CPU)
+- Qwen3 via vLLM (or any OpenAI-compatible endpoint) for SQL generation and descriptions
+- sqlglot 26.x for SQL safety validation (7 rules)
+- PyJWT for HS256 token validation
