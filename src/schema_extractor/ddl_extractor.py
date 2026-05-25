@@ -7,6 +7,10 @@ class ColummnInfo:
     """
     Represents one column in a table.
     This is structure of the columns_info JSONB array in metadata DB.
+
+    `description` carries the column comment from pg_description (set via
+    `COMMENT ON COLUMN ...`) when present in the target DB. Empty otherwise —
+    the LLM-description step or the structural fallback fills it later.
     """
     name: str
     data_type: str
@@ -14,17 +18,22 @@ class ColummnInfo:
     column_default: str | None
     is_primary_key: bool = False
     is_unique: bool = False
+    description: str = ""
 
 @dataclass
 class TableDDL:
     """
     Represents all extracted information for a single table.
     Holds both the structured column list and the reconstructed DDL string.
+
+    `table_description` carries the table comment from pg_description (set via
+    `COMMENT ON TABLE ...`) when present in the target DB. Empty otherwise.
     """
     table_name: str
     schema_name: str = 'public'
-    columns: list[ColummnInfo] = field(default_factory=list) #TODO ask what field() does
+    columns: list[ColummnInfo] = field(default_factory=list)
     ddl_text: str = ""
+    table_description: str = ""
 
 def get_keys(connection: psycopg2.extensions.connection, table_name: str, constraint_type: str='PRIMARY KEY') -> set[str]:
     """
@@ -47,12 +56,70 @@ def get_keys(connection: psycopg2.extensions.connection, table_name: str, constr
     
     return [row['column_name'] for row in rows]
 
-def get_columns(connection: psycopg2.extensions.connection, table_name: str) -> list[ColummnInfo]:
+def get_column_comments(
+    connection: psycopg2.extensions.connection,
+    table_name: str,
+    schema_name: str = 'public',
+) -> dict[str, str]:
     """
-    Fetches all columns for a table from information_schema.columns.
+    Returns {column_name: comment} for every column in the table that has a
+    non-empty comment in pg_description. Columns without comments are omitted.
+
+    Comments are written via `COMMENT ON COLUMN schema.table.col IS '...';` and
+    stored in pg_description (objsubid = column ordinal, > 0).
     """
     query = """
-            SELECT 
+        SELECT a.attname AS column_name,
+               pgd.description AS comment
+        FROM pg_catalog.pg_attribute a
+        JOIN pg_catalog.pg_class c ON c.oid = a.attrelid
+        JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+        LEFT JOIN pg_catalog.pg_description pgd
+               ON pgd.objoid = a.attrelid AND pgd.objsubid = a.attnum
+        WHERE n.nspname = %(schema_name)s
+          AND c.relname = %(table_name)s
+          AND a.attnum > 0
+          AND NOT a.attisdropped;
+    """
+    with connection.cursor() as cursor:
+        cursor.execute(query, {"schema_name": schema_name, "table_name": table_name})
+        rows = cursor.fetchall()
+
+    return {row['column_name']: row['comment'] for row in rows if row['comment']}
+
+
+def get_table_comment(
+    connection: psycopg2.extensions.connection,
+    table_name: str,
+    schema_name: str = 'public',
+) -> str:
+    """
+    Returns the table-level comment from pg_description (objsubid = 0), or ""
+    when none is set. Comments are written via `COMMENT ON TABLE ...`.
+    """
+    query = """
+        SELECT pgd.description AS comment
+        FROM pg_catalog.pg_class c
+        JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+        LEFT JOIN pg_catalog.pg_description pgd
+               ON pgd.objoid = c.oid AND pgd.objsubid = 0
+        WHERE n.nspname = %(schema_name)s
+          AND c.relname = %(table_name)s;
+    """
+    with connection.cursor() as cursor:
+        cursor.execute(query, {"schema_name": schema_name, "table_name": table_name})
+        row = cursor.fetchone()
+
+    return (row['comment'] if row and row['comment'] else "")
+
+
+def get_columns(connection: psycopg2.extensions.connection, table_name: str) -> list[ColummnInfo]:
+    """
+    Fetches all columns for a table from information_schema.columns and
+    enriches each with its pg_description comment (when present).
+    """
+    query = """
+            SELECT
                 column_name,
                 data_type,
                 is_nullable,
@@ -63,13 +130,14 @@ def get_columns(connection: psycopg2.extensions.connection, table_name: str) -> 
                 AND table_schema = 'public'
             ORDER BY ordinal_position;
         """
-    
+
     with connection.cursor() as cursor:
         cursor.execute(query, {"table_name": table_name})
         rows = cursor.fetchall()
-    
+
     pk_cols = get_keys(connection=connection, table_name=table_name, constraint_type='PRIMARY KEY')
     unique_cols = get_keys(connection=connection, table_name=table_name, constraint_type='UNIQUE')
+    comments = get_column_comments(connection=connection, table_name=table_name)
 
     columns = []
 
@@ -81,11 +149,12 @@ def get_columns(connection: psycopg2.extensions.connection, table_name: str) -> 
             is_nullable=row['is_nullable'],
             column_default=row['column_default'],
             is_primary_key=row['column_name'] in pk_cols,
-            is_unique=row['column_name'] in unique_cols
+            is_unique=row['column_name'] in unique_cols,
+            description=comments.get(row['column_name'], ""),
         )
 
         columns.append(col)
-    
+
     return columns
 
 def build_ddl(table_name: str, columns: list[ColummnInfo]) -> str:
@@ -118,15 +187,17 @@ def build_ddl(table_name: str, columns: list[ColummnInfo]) -> str:
 
 def extract_table_ddl(connection: psycopg2.extensions.connection, table_name: str) -> TableDDL:
     """
-    According to the build_ddl() and get_columns() methods returns a full TableDDL object.
+    Builds a full TableDDL object: column metadata (with pg_description comments),
+    reconstructed CREATE TABLE statement, and the table-level comment.
     """
     columns = get_columns(connection=connection, table_name=table_name)
-
     ddl_text = build_ddl(table_name=table_name, columns=columns)
+    table_description = get_table_comment(connection=connection, table_name=table_name)
 
     return TableDDL(
         table_name=table_name,
         schema_name='public',
         columns=columns,
-        ddl_text=ddl_text
+        ddl_text=ddl_text,
+        table_description=table_description,
     )
