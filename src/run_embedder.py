@@ -1,22 +1,24 @@
 """
-Phase 3 — Description Generation + Embedding
+Description-text + BGE-M3 embedding for one target DB.
 
-For every table already indexed in the metadata DB:
-  1. Build a structured text blob (table description + column descriptions + FK context)
-  2. Enrich columns_info JSONB with per-column descriptions
-  3. Embed the text blob with BAAI/bge-m3
-  4. Write table_description, updated columns_info, and embedding back to table_metadata
+For every table belonging to a registered DB, this module:
+  1. Builds a structured text blob (table description + column descriptions
+     + FK context + related-tables line)
+  2. Enriches columns_info JSONB with per-column descriptions (kept where
+     present, generated structurally otherwise)
+  3. Embeds the text blob with BAAI/bge-m3
+  4. Writes table_description (only when missing), updated columns_info, and
+     the 1024-dim embedding back to table_metadata.
 
-Prerequisites:
-  - Phase 2 must have run (table_metadata and table_relationships must be populated)
-  - Run migrations/001_add_embedding_column.sql against nl2sql_metadata first
+Public surface:
+    embed_one_db(meta_conn, db_name, embedder) — embed every table for db_name
+                                                  using the supplied Embedder.
 
-Run from src/:
-    python run_phase3.py
-    python run_phase3.py ../env/.env ERPHUB   # explicit env path + DB name
+The legacy `python run_embedder.py [env_path] [db_name]` CLI is kept for
+ad-hoc local dev — it loads its own Embedder and connects via env vars.
 """
-import sys
 import os
+import sys
 import json
 
 import psycopg2
@@ -38,7 +40,7 @@ from description_embedder.embedder import Embedder
 
 # ── DB helpers ────────────────────────────────────────────────────────────────
 
-def load_tables(conn, db_name: str) -> list[dict]:
+def _load_tables(conn, db_name: str) -> list[dict]:
     """Return all table_metadata rows for the given registered database."""
     query = """
         SELECT tm.id, tm.table_name, tm.schema_name, tm.columns_info, tm.table_description
@@ -52,10 +54,10 @@ def load_tables(conn, db_name: str) -> list[dict]:
         return cur.fetchall()
 
 
-def load_col_fk_maps(conn, db_name: str) -> dict[str, dict[str, tuple]]:
+def _load_col_fk_maps(conn, db_name: str) -> dict[str, dict[str, tuple]]:
     """
     Return {source_table: {source_column: (target_table, target_column)}}.
-    Used to detect FK columns and generate "references X.y" descriptions.
+    Used to detect FK columns and to label them "references X.y".
     """
     query = """
         SELECT tr.source_table, tr.source_column, tr.target_table, tr.target_column
@@ -73,7 +75,7 @@ def load_col_fk_maps(conn, db_name: str) -> dict[str, dict[str, tuple]]:
     return fk_maps
 
 
-def load_related_tables(conn, db_name: str) -> dict[str, list[str]]:
+def _load_related_tables(conn, db_name: str) -> dict[str, list[str]]:
     """
     Return {table: [directly related tables]} treating FK edges as undirected.
     These appear in the "Related tables:" line of the embedding text.
@@ -94,7 +96,7 @@ def load_related_tables(conn, db_name: str) -> dict[str, list[str]]:
     return {k: sorted(v) for k, v in related.items()}
 
 
-def update_table_row(
+def _update_table_row(
     conn,
     table_id: int,
     description: str,
@@ -104,13 +106,17 @@ def update_table_row(
     """
     Write description, enriched columns_info, and embedding back to one row.
     The embedding is passed as a bracketed string and cast to vector by pgvector.
+
+    `description` is only written when the existing value is empty — this
+    prevents the embedder's structural fallback ("Stores X records") from
+    overwriting a pg_description comment or a real LLM-generated description.
     """
     embedding_str = "[" + ",".join(f"{v:.8f}" for v in embedding) + "]"
 
     query = """
         UPDATE table_metadata
         SET
-            table_description = %(description)s,
+            table_description = COALESCE(NULLIF(table_description, ''), %(description)s),
             columns_info      = %(columns_info)s::jsonb,
             embedding         = %(embedding)s::vector,
             updated_at        = now()
@@ -126,34 +132,32 @@ def update_table_row(
     conn.commit()
 
 
-# ── Main ──────────────────────────────────────────────────────────────────────
+# ── Public entry point ────────────────────────────────────────────────────────
 
-def run(env_path: str = DEFAULT_ENV_PATH, db_name: str = None) -> None:
+def embed_one_db(
+    meta_conn,
+    db_name: str,
+    embedder: Embedder,
+) -> int:
+    """
+    Build text blobs and embeddings for every table of `db_name` and write
+    them back. Returns the number of tables embedded.
+    """
     logger = get_logger(__name__)
-    load_dotenv(env_path)
 
-    if db_name is None:
-        db_name = os.getenv("POSTGRES_DB_NAME")
+    tables      = _load_tables(meta_conn, db_name)
+    col_fk_maps = _load_col_fk_maps(meta_conn, db_name)
+    related     = _load_related_tables(meta_conn, db_name)
 
-    # ── Step 1: load metadata ────────────────────────────────────────────────
-    logger.info("[1/4] Connecting to metadata DB...")
-    try:
-        conn = get_metadata_connection(env_path=env_path)
-    except Exception as e:
-        logger.error("Failed to connect to metadata DB: %s", e, exc_info=True)
-        raise
+    if not tables:
+        logger.warning("[embed] '%s' — no tables found in metadata; skipping", db_name)
+        return 0
 
-    logger.info("[2/4] Loading tables and FK relationships for '%s'...", db_name)
-    tables      = load_tables(conn, db_name)
-    col_fk_maps = load_col_fk_maps(conn, db_name)
-    related     = load_related_tables(conn, db_name)
-    logger.info("      %d tables loaded.", len(tables))
+    logger.info("[embed] '%s' — building text blobs for %d tables", db_name, len(tables))
 
-    # ── Step 2: build text blobs ─────────────────────────────────────────────
-    logger.info("[3/4] Building description text blobs...")
-    texts            = []
-    descriptions     = []
-    enriched_cols    = []
+    texts          = []
+    descriptions   = []
+    enriched_cols  = []
 
     for row in tables:
         table_name    = row['table_name']
@@ -161,52 +165,60 @@ def run(env_path: str = DEFAULT_ENV_PATH, db_name: str = None) -> None:
         col_fk_map    = col_fk_maps.get(table_name, {})
         table_related = related.get(table_name, [])
 
+        # Existing pg_description comment wins; fall back to structural sentence.
         table_desc = row['table_description'] or generate_table_description(table_name)
-        text       = build_embedding_text(
-            table_name=table_name,
-            table_description=table_desc,
-            columns=columns,
-            col_fk_map=col_fk_map,
-            related_tables=table_related,
+        text = build_embedding_text(
+            table_name        = table_name,
+            table_description = table_desc,
+            columns           = columns,
+            col_fk_map        = col_fk_map,
+            related_tables    = table_related,
         )
-        enriched   = enrich_columns_with_descriptions(columns, col_fk_map)
+        enriched = enrich_columns_with_descriptions(columns, col_fk_map)
 
         texts.append(text)
         descriptions.append(table_desc)
         enriched_cols.append(enriched)
 
-    logger.info("      Built %d text blobs.", len(texts))
-
-    # ── Step 3: embed ────────────────────────────────────────────────────────
-    logger.info("[4/4] Generating embeddings with BAAI/bge-m3...")
-    embedder   = Embedder()
+    logger.info("[embed] '%s' — encoding %d text blobs with BGE-M3", db_name, len(texts))
     embeddings = embedder.embed(texts)
-    logger.info("      %d embeddings generated.", len(embeddings))
 
-    # ── Step 4: write back ───────────────────────────────────────────────────
-    logger.info("      Writing descriptions and embeddings to metadata DB...")
+    logger.info("[embed] '%s' — writing embeddings to metadata DB", db_name)
     for i, row in enumerate(tables):
-        try:
-            update_table_row(
-                conn,
-                table_id         = row['id'],
-                description      = descriptions[i],
-                enriched_columns = enriched_cols[i],
-                embedding        = embeddings[i],
-            )
-            logger.debug("        [%3d/%d] %s", i + 1, len(tables), row['table_name'])
-        except Exception as e:
-            logger.error("        Failed on table '%s': %s", row['table_name'], e, exc_info=True)
-            raise
+        _update_table_row(
+            meta_conn,
+            table_id         = row['id'],
+            description      = descriptions[i],
+            enriched_columns = enriched_cols[i],
+            embedding        = embeddings[i],
+        )
+        logger.debug("[embed] '%s' [%3d/%d] %s", db_name, i + 1, len(tables), row['table_name'])
 
-    conn.close()
     logger.info(
-        "Embedding complete — DB: %s | tables embedded: %d | dim: 1024 | model: BAAI/bge-m3",
+        "[embed] '%s' — done: %d tables embedded (dim=1024, model=BAAI/bge-m3)",
         db_name, len(tables),
     )
+    return len(tables)
+
+
+# ── Legacy CLI ────────────────────────────────────────────────────────────────
+
+def _run_from_env(env_path: str = DEFAULT_ENV_PATH, db_name: str | None = None) -> None:
+    logger = get_logger(__name__)
+    load_dotenv(env_path)
+
+    if db_name is None:
+        db_name = os.getenv("POSTGRES_DB_NAME")
+
+    meta_conn = get_metadata_connection(env_path=env_path)
+    try:
+        embedder = Embedder()
+        embed_one_db(meta_conn, db_name, embedder)
+    finally:
+        meta_conn.close()
 
 
 if __name__ == "__main__":
     env = sys.argv[1] if len(sys.argv) > 1 else DEFAULT_ENV_PATH
     db  = sys.argv[2] if len(sys.argv) > 2 else None
-    run(env_path=env, db_name=db)
+    _run_from_env(env_path=env, db_name=db)
