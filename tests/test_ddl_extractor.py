@@ -1,10 +1,80 @@
 """
 Unit tests for ddl_extractor.py
 
-Tests build_ddl() and the ColummnInfo dataclass — no DB connection needed.
+Tests build_ddl(), ColummnInfo, and the pg_description comment extractors.
+The comment-extractor tests mock psycopg2 — no real DB connection needed.
 """
+from unittest.mock import MagicMock
+
 import pytest
-from schema_extractor.ddl_extractor import ColummnInfo, build_ddl
+from schema_extractor.ddl_extractor import (
+    ColummnInfo,
+    build_ddl,
+    get_column_comments,
+    get_table_comment,
+)
+
+
+def _mock_conn(rows):
+    """Return a mock psycopg2 connection whose cursor.fetchall/fetchone returns `rows`."""
+    cursor = MagicMock()
+    cursor.fetchall.return_value = rows
+    cursor.fetchone.return_value = rows[0] if rows else None
+    conn = MagicMock()
+    conn.cursor.return_value.__enter__ = MagicMock(return_value=cursor)
+    conn.cursor.return_value.__exit__ = MagicMock(return_value=False)
+    return conn, cursor
+
+
+class TestColumnInfoDescription:
+    def test_default_description_is_empty(self):
+        col = ColummnInfo(
+            name="id",
+            data_type="integer",
+            is_nullable=False,
+            column_default=None,
+        )
+        assert col.description == ""
+
+    def test_description_can_be_set(self):
+        col = ColummnInfo(
+            name="email",
+            data_type="text",
+            is_nullable=False,
+            column_default=None,
+            description="user's primary email",
+        )
+        assert col.description == "user's primary email"
+
+
+class TestGetColumnComments:
+    def test_returns_only_columns_with_non_empty_comments(self):
+        conn, _ = _mock_conn([
+            {"column_name": "id",     "comment": "primary key"},
+            {"column_name": "email",  "comment": "contact email"},
+            {"column_name": "notes",  "comment": None},
+            {"column_name": "blank",  "comment": ""},
+        ])
+        result = get_column_comments(conn, table_name="users")
+        assert result == {"id": "primary key", "email": "contact email"}
+
+    def test_returns_empty_dict_when_no_rows(self):
+        conn, _ = _mock_conn([])
+        assert get_column_comments(conn, table_name="empty") == {}
+
+
+class TestGetTableComment:
+    def test_returns_comment_string_when_present(self):
+        conn, _ = _mock_conn([{"comment": "stores user accounts"}])
+        assert get_table_comment(conn, table_name="users") == "stores user accounts"
+
+    def test_returns_empty_when_comment_is_null(self):
+        conn, _ = _mock_conn([{"comment": None}])
+        assert get_table_comment(conn, table_name="users") == ""
+
+    def test_returns_empty_when_no_row(self):
+        conn, _ = _mock_conn([])
+        assert get_table_comment(conn, table_name="missing") == ""
 
 
 class TestBuildDDL:
