@@ -46,13 +46,9 @@ for key, val in [
     if not val:
         raise ValueError(f"Missing required env var: {key}")
 
-_raw_creds = os.getenv("REGISTERED_DB_CREDENTIALS")
-if not _raw_creds:
-    raise ValueError("Missing required env var: REGISTERED_DB_CREDENTIALS")
-try:
-    REGISTERED_DB_CREDENTIALS: dict = json.loads(_raw_creds)
-except json.JSONDecodeError as e:
-    raise ValueError(f"REGISTERED_DB_CREDENTIALS is not valid JSON: {e}")
+DB_CRED_ENCRYPTION_KEY = os.getenv("DB_CRED_ENCRYPTION_KEY")
+if not DB_CRED_ENCRYPTION_KEY:
+    raise ValueError("Missing required env var: DB_CRED_ENCRYPTION_KEY")
 
 llm_client = AsyncOpenAI(base_url=LLM_BASE_URL, api_key="EMPTY")
 
@@ -67,30 +63,62 @@ MIN_RELEVANCE_SCORE = float(os.getenv("MIN_RELEVANCE_SCORE", "0.5"))
 async def lifespan(app: FastAPI):
     logger.info("Starting up...")
 
-    # One asyncpg pool per registered DB
-    app.state.db_pools = {}
-    for db_name, creds in REGISTERED_DB_CREDENTIALS.items():
-        app.state.db_pools[db_name] = await asyncpg.create_pool(
-            host=creds["host"],
-            port=creds.get("port", 5432),
-            user=creds["user"],
-            password=creds["password"],
-            database=db_name,
-        )
-        logger.info("Target DB pool ready (%s)", db_name)
-
-    # Metadata DB pool
+    # Metadata DB pool — created first because we read every other piece of
+    # configuration (target-DB credentials, db_id map) out of it.
     app.state.meta_pool = await asyncpg.create_pool(
         host=META_HOST, port=META_PORT,
         user=META_USER, password=META_PASSWORD, database=META_DB_NAME,
     )
     logger.info("Metadata DB pool ready (%s)", META_DB_NAME)
 
-    # Cache db_name → db_id mapping from registered_databases
+    # Read target-DB credentials from registered_databases. Skip rows that
+    # haven't been indexed yet (no table_metadata rows) or that have an
+    # outstanding indexing_error — they would never serve a useful response.
     async with app.state.meta_pool.acquire() as conn:
-        rows = await conn.fetch("SELECT id, db_name FROM registered_databases")
-    app.state.db_ids = {r["db_name"]: r["id"] for r in rows}
-    logger.info("Loaded db_id map: %s", app.state.db_ids)
+        registered = await conn.fetch(
+            """
+            SELECT rd.id,
+                   rd.db_name,
+                   rd.host,
+                   rd.port,
+                   rd.schema_name,
+                   rd.db_user,
+                   pgp_sym_decrypt(rd.db_password_encrypted, $1) AS db_password
+            FROM registered_databases rd
+            JOIN (
+                SELECT db_id, COUNT(*) AS cnt
+                FROM table_metadata
+                GROUP BY db_id
+            ) tm ON tm.db_id = rd.id
+            WHERE rd.indexing_error IS NULL
+              AND tm.cnt > 0
+              AND rd.db_password_encrypted IS NOT NULL
+            ORDER BY rd.id;
+            """,
+            DB_CRED_ENCRYPTION_KEY,
+        )
+
+    app.state.db_pools = {}
+    app.state.db_ids   = {}
+    for row in registered:
+        app.state.db_pools[row["db_name"]] = await asyncpg.create_pool(
+            host=row["host"],
+            port=row["port"],
+            user=row["db_user"],
+            password=row["db_password"],
+            database=row["db_name"],
+        )
+        app.state.db_ids[row["db_name"]] = row["id"]
+        logger.info("Target DB pool ready (%s)", row["db_name"])
+
+    if not app.state.db_pools:
+        logger.warning(
+            "No registered target DBs are ready to serve. The API will start "
+            "but every /generate request will return 400 until at least one "
+            "row in registered_databases is indexed."
+        )
+    else:
+        logger.info("Loaded db_id map: %s", app.state.db_ids)
 
     # Embedder (loads BGE-M3 once)
     logger.info("Loading BGE-M3 embedder...")
