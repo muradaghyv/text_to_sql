@@ -1,5 +1,6 @@
 env/.env
 tests/sample_token.json
+important_notes.md
 
 logs/
 
