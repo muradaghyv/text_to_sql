@@ -4,7 +4,7 @@
 -- psql -h <host> -U postgres -d nl2sql_metadata -f migrations/000_create_metadata_db.sql
 
 -- Databases that have been indexed
-CREATE TABLE registered_databases (
+CREATE TABLE IF NOT EXISTS registered_databases (
     id          SERIAL PRIMARY KEY,
     db_name     VARCHAR(255) NOT NULL UNIQUE,
     host        VARCHAR(255) NOT NULL,
@@ -16,7 +16,7 @@ CREATE TABLE registered_databases (
 );
 
 -- Metadata about each table
-CREATE TABLE table_metadata (
+CREATE TABLE IF NOT EXISTS table_metadata (
     id                SERIAL PRIMARY KEY,
     db_id             INTEGER      NOT NULL REFERENCES registered_databases(id) ON DELETE CASCADE,
     schema_name       VARCHAR(255) NOT NULL DEFAULT 'public',
@@ -32,7 +32,7 @@ CREATE TABLE table_metadata (
 );
 
 -- FK relationships extracted from information_schema
-CREATE TABLE table_relationships (
+CREATE TABLE IF NOT EXISTS table_relationships (
     id                SERIAL PRIMARY KEY,
     db_id             INTEGER      NOT NULL REFERENCES registered_databases(id) ON DELETE CASCADE,
     source_schema     VARCHAR(255) NOT NULL,
@@ -47,11 +47,11 @@ CREATE TABLE table_relationships (
 );
 
 -- Index for fast lookup by db
-CREATE INDEX idx_table_metadata_db_id ON table_metadata (db_id);
+CREATE INDEX IF NOT EXISTS idx_table_metadata_db_id ON table_metadata (db_id);
 
 -- Index for fast lookup by source/target table
-CREATE INDEX idx_relationships_source ON table_relationships (db_id, source_schema, source_table);
-CREATE INDEX idx_relationships_target ON table_relationships (db_id, target_schema, target_table);
+CREATE INDEX IF NOT EXISTS idx_relationships_source ON table_relationships (db_id, source_schema, source_table);
+CREATE INDEX IF NOT EXISTS idx_relationships_target ON table_relationships (db_id, target_schema, target_table);
 
 -- Grant nl2sql_user access to everything in the metadata DB
 GRANT ALL PRIVILEGES ON ALL TABLES IN SCHEMA public TO nl2sql_user;
